@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.3.0"
+const version = "1.4.0"
 
 func newHTTPClient(maxIdle int) *http.Client {
 	tr := &http.Transport{
@@ -53,8 +53,10 @@ func main() {
 	}
 
 	hc := newHTTPClient(4)
-	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, hc),
-		NewLLMChain(cfg.APIBase, cfg.APIKey, cfg.modelChain(), hc))
+	llm := NewLLMChain(cfg.APIBase, cfg.APIKey, cfg.modelChain(), hc)
+	llm.MaxTokens = cfg.MaxTokens
+	llm.Temperature = cfg.Temperature
+	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, hc), llm)
 	if b.dbErr != nil {
 		logf("ERROR", "%s", b.dbErr.Error())
 		os.Exit(2)

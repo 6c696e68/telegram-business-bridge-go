@@ -241,6 +241,7 @@ func ownerConn(id string, owner int64, enabled, canReply bool) BusinessConnectio
 
 func newHarness(mut func(*Config)) *harness {
 	cfg := defaultConfig()
+	cfg.DebounceMS = 0 // tests opt in explicitly; keeps the suite fast
 	cfg.BotToken = "123:TESTTOKEN"
 	cfg.OwnerID = testOwner
 	cfg.OwnerUsername = "example_owner"
@@ -1156,8 +1157,8 @@ func TestDistillSingleFlight(t *testing.T) {
 	}
 	for i := 0; i < 4; i++ {
 		h.b.handleUpdate(dm(610, 610, "msg"))
+		waitSent(t, h, i+1)
 	}
-	waitSent(t, h, 4)
 	waitFor(t, "first distill started", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1191,6 +1192,7 @@ func TestDistillAbortedByReset(t *testing.T) {
 		return "ok", false
 	}
 	h.b.handleUpdate(dm(611, 611, "m1"))
+	waitSent(t, h, 1)
 	h.b.handleUpdate(dm(611, 611, "m2"))
 	waitSent(t, h, 2)
 	select {

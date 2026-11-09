@@ -22,8 +22,10 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   verbatim quotes, so only generic behavioural rules are persisted.
 - `rules.pinned.md`: a second, owner-only rules file. The program reads and injects it verbatim and
   **never writes it**, so your hand-written rules can never be overwritten by the LLM.
-- Owner commands (owner only, private chat or a business chat): `/pause`, `/resume`, `/status`, `/reload`,
-  `/rules [reset|off|on]`, `/forget`.
+- Owner commands (owner only, private chat or a business chat): `/pause`, `/resume`, `/status`, `/stats`,
+  `/reload`, `/rules [reset|off|on]`, `/forget`.
+- Bursts are coalesced: consecutive messages within `debounce_ms` produce one reply that answers the
+  whole burst, saving tokens and avoiding duplicate answers.
 - Limits: replies per user per hour, daily cap, bounded concurrent LLM calls, LRU chat memory with a
   per-chat character cap.
 - Retries on LLM 429/5xx/transport errors and on Telegram flood control (`retry_after`).
@@ -102,6 +104,9 @@ it can be deleted. Only one process may open the database at a time.
 | `fallback_models` | `[]` | model names tried after the primary on 429/5xx |
 | `shutdown_drain_sec` | 15 | seconds to wait for in-flight replies on SIGTERM (0 = off) |
 | `stats_log_min` | 60 | minutes between non-sensitive stats log lines (0 = off) |
+| `debounce_ms` | 700 | wait this long for a burst before replying (0 = reply per message) |
+| `max_tokens` | 1200 | completion token cap per reply |
+| `temperature` | 0 | sampling temperature; 0 keeps the provider default |
 | `health_addr` | `""` (off) | loopback address for `GET /healthz`, e.g. `127.0.0.1:8099` |
 
 The LLM rewrites the whole file (`UNCHANGED` means "no change"). Phone numbers (including

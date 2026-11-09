@@ -172,6 +172,7 @@ func (f *fakeLLMServer) authHeaders() []string {
 
 func integConfig(tgURL, llmURL string) Config {
 	cfg := defaultConfig()
+	cfg.DebounceMS = 0
 	cfg.BotToken = integToken
 	cfg.TelegramBase = tgURL
 	cfg.APIBase = llmURL + "/v1"
@@ -431,6 +432,7 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 	tgSrv.mu.Unlock()
 
 	cfg := defaultConfig()
+	cfg.DebounceMS = 0
 	cfg.BotToken = integToken
 	cfg.TelegramBase = tgSrv.URL
 	cfg.OwnerID = 1000000001

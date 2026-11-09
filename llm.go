@@ -29,11 +29,13 @@ func (e *LLMError) Error() string {
 }
 
 type LLM struct {
-	url    string
-	key    string
-	models []string
-	hc     *http.Client
-	lastOK atomic.Int64 // index of the last model that answered successfully
+	url         string
+	key         string
+	models      []string
+	hc          *http.Client
+	MaxTokens   int     // <=0 keeps the built-in default
+	Temperature float64 // 0 omits the field (provider default)
+	lastOK      atomic.Int64
 }
 
 // NewLLM keeps the single-model constructor used by tests and callers that
@@ -50,10 +52,11 @@ func NewLLMChain(apiBase, key string, models []string, hc *http.Client) *LLM {
 		models = []string{""}
 	}
 	return &LLM{
-		url:    strings.TrimRight(apiBase, "/") + "/chat/completions",
-		key:    key,
-		models: models,
-		hc:     hc,
+		url:       strings.TrimRight(apiBase, "/") + "/chat/completions",
+		key:       key,
+		models:    models,
+		hc:        hc,
+		MaxTokens: 1200,
 	}
 }
 
@@ -102,7 +105,14 @@ func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 }
 
 func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg) (string, error) {
-	body, err := json.Marshal(map[string]any{"model": model, "messages": msgs, "max_tokens": 1200})
+	payload := map[string]any{"model": model, "messages": msgs, "max_tokens": l.MaxTokens}
+	if l.MaxTokens <= 0 {
+		payload["max_tokens"] = 1200
+	}
+	if l.Temperature > 0 {
+		payload["temperature"] = l.Temperature
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", &LLMError{Kind: "bad_response"}
 	}

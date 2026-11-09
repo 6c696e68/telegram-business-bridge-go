@@ -30,6 +30,9 @@ type Config struct {
 	LLMRetries       int      `json:"llm_retries"`
 	FallbackModels   []string `json:"fallback_models"`
 	ShutdownDrainSec int      `json:"shutdown_drain_sec"`
+	DebounceMS       int      `json:"debounce_ms"`
+	MaxTokens        int      `json:"max_tokens"`
+	Temperature      float64  `json:"temperature"`
 	DBFile           string   `json:"db_file"`
 	FlushSec         int      `json:"flush_sec"`
 	MemoryDays       int      `json:"memory_days"`
@@ -62,6 +65,8 @@ func defaultConfig() Config {
 		MaxChats:         500,
 		LLMRetries:       2,
 		ShutdownDrainSec: 15,
+		DebounceMS:       700,
+		MaxTokens:        1200,
 		StatsLogMin:      60,
 		FlushSec:         30,
 		MemoryDays:       7,
@@ -142,6 +147,18 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.StatsLogMin < 0 {
 		cfg.StatsLogMin = 0
+	}
+	if cfg.DebounceMS < 0 {
+		cfg.DebounceMS = 0
+	}
+	if cfg.MaxTokens < 16 {
+		cfg.MaxTokens = 16
+	}
+	if cfg.Temperature < 0 {
+		cfg.Temperature = 0
+	}
+	if cfg.Temperature > 2 {
+		cfg.Temperature = 2
 	}
 	return cfg, nil
 }

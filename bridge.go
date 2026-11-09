@@ -44,6 +44,8 @@ type chatState struct {
 	introduced bool
 	updated    int64
 	runes      int
+	userGen    int // bumped on every remembered user message
+	repliedGen int // highest userGen already covered by a sent reply
 	active     int // reply jobs holding this chat; active chats are never evicted
 	lk         sync.Mutex
 	el         *list.Element
@@ -93,6 +95,7 @@ type Bridge struct {
 	distillActive bool
 
 	lastPrune time.Time
+	startedAt time.Time
 	jobWG     sync.WaitGroup
 }
 
@@ -117,6 +120,7 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		rulesRunOn:   true,
 	}
 	b.day = b.now().Format("2006-01-02")
+	b.startedAt = b.now()
 	if cfg.DBFile != "" {
 		b.openDB(cfg.DBFile)
 		if b.dbErr != nil {
@@ -414,6 +418,19 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			// Two capped files can exceed Telegram's limit; keep the send valid.
 			msg = truncUTF16(msg, telegramUnitLimit)
 		}
+	case "/stats":
+		st := b.snapshotRuntime()
+		b.mu.Lock()
+		up := b.now().Sub(b.startedAt)
+		b.mu.Unlock()
+		state := "bật"
+		if !b.rulesOn() {
+			state = "tắt"
+		}
+		msg = fmt.Sprintf("RSS %.1f MB | Heap %.1f MB | Goroutine %d\nDB %.2f MB, %d chat (RAM %d)\nUptime %s | Trả lời hôm nay: %d\nRules: %s (%d ký tự)",
+			float64(st.RSSBytes)/(1<<20), float64(st.HeapBytes)/(1<<20), st.Goroutines,
+			float64(st.DBBytes)/(1<<20), st.ChatsDB, st.ChatsRAM,
+			up.Truncate(time.Minute), st.DayCount, state, st.RulesChars)
 	case "/forget":
 		b.mu.Lock()
 		if cs, ok := b.chats[key]; ok {
@@ -468,7 +485,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			msg += "\nRules: tắt"
 		}
 	default:
-		msg = "Lệnh: /pause /resume /status /reload /rules [reset|off|on]"
+		msg = "Lệnh: /pause /resume /status /stats /reload /rules [reset|off|on] /forget"
 	}
 	b.sendMsg(chatID, msg, conn)
 	return "owner_cmd"
@@ -504,6 +521,7 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 		return "rate_limited"
 	}
 	cs := b.rememberLocked(key, "user", text)
+	cs.userGen++
 	cs.active++
 	b.mu.Unlock()
 
@@ -622,11 +640,23 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	cs.lk.Lock() // one reply at a time per chat keeps the conversation ordered
 	defer cs.lk.Unlock()
 
+	// Wait a moment so a burst of consecutive messages is answered together
+	// (one reply, lower token cost) instead of once per message.
+	if d := time.Duration(b.cfg.DebounceMS) * time.Millisecond; d > 0 {
+		b.sleep(context.Background(), d)
+	}
+
 	b.mu.Lock()
 	if b.paused || b.isMutedLocked(key) {
 		b.mu.Unlock()
 		return
 	}
+	// Another job already answered everything we would answer.
+	if cs.userGen <= cs.repliedGen {
+		b.mu.Unlock()
+		return
+	}
+	gen := cs.userGen
 	note := introFirst
 	if cs.introduced {
 		note = introDone
@@ -667,6 +697,7 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	fire := false
 	b.mu.Lock()
 	cs.introduced = true
+	cs.repliedGen = gen
 	b.rememberLocked(key, "assistant", reply)
 	if b.rulesOn() {
 		b.rulesPending++

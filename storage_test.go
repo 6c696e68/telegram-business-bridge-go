@@ -16,6 +16,7 @@ import (
 
 func dbTestConfig(dir string, mut func(*Config)) Config {
 	cfg := defaultConfig()
+	cfg.DebounceMS = 0
 	cfg.BotToken = "123:TESTTOKEN"
 	cfg.OwnerID = testOwner
 	cfg.OwnerUsername = "example_owner"
@@ -170,7 +171,8 @@ func TestHistoryCharCap(t *testing.T) {
 		h.b.handleUpdate(dm(int64(700+i), int64(700+i), strings.Repeat("x", 150)))
 		h.b.handleUpdate(dm(int64(700+i), int64(700+i), strings.Repeat("y", 150)))
 	}
-	waitSent(t, h, 12)
+	// bursts are coalesced into one reply per chat (>=6 sends, maybe fewer than 12)
+	waitSent(t, h, 6)
 	settle()
 	h.b.mu.Lock()
 	defer h.b.mu.Unlock()
