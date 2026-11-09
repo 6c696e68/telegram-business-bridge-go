@@ -763,10 +763,15 @@ func TestNonTextMessageGetsPlaceholder(t *testing.T) {
 
 func TestWhitespaceOnlyTextDoesNotPanic(t *testing.T) {
 	h := newHarness(nil)
-	if got := h.b.handleUpdate(dm(testOwner, testOwner, "   ")); got != "queued" {
-		t.Fatalf("got %q", got)
+	if got := h.b.handleUpdate(dm(4242, 4242, "   ")); got != "queued" {
+		t.Fatalf("customer got %q", got)
 	}
 	waitSent(t, h, 1)
+	// The owner's private chat is a control panel: blank text gets the hint.
+	if got := h.b.handleUpdate(dm(testOwner, testOwner, "   ")); got != "owner_cmd" {
+		t.Fatalf("owner got %q", got)
+	}
+	waitSent(t, h, 2)
 }
 
 func TestSafeHandleRecoversFromPanic(t *testing.T) {

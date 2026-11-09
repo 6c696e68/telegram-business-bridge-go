@@ -164,7 +164,8 @@ func (b *Bridge) rulesNoteLocked() string {
 }
 
 const distillSystemPrompt = "You maintain the long-term rules file for an automatic Telegram assistant.\n" +
-	"Input: the current rules and recent chats. Output: either the single word UNCHANGED or the complete new markdown file that\n" +
+	"Input: the owner's rules, the current AI rules and recent chats. Output: either the single word UNCHANGED or the complete new AI rules markdown file that\n" +
+	"- treats OWNER RULES as binding and owned by the owner: never contradicts them, never repeats them, and drops any AI rule that conflicts with them;\n" +
 	"- keeps rules that are still true, removes stale or wrong ones, and adds only durable behavioural rules useful for FUTURE replies;\n" +
 	"- never copies wording of the chats; contains no verbatim quotes;\n" +
 	"- STRICTLY FORBIDDEN in the file: full names, phone numbers, emails, Telegram handles other than the owner tag,\n" +
@@ -208,7 +209,12 @@ func (b *Bridge) buildDistillInputLocked() (string, []string) {
 	if cur == "" {
 		cur = "(none yet)"
 	}
-	return "=== CURRENT RULES ===\n" + cur + "\n\n=== RECENT CHATS ===\n" +
+	owner := b.rulesPinned
+	if strings.TrimSpace(owner) == "" {
+		owner = "(none)"
+	}
+	return "=== OWNER RULES (binding, read-only) ===\n" + owner +
+		"\n\n=== CURRENT RULES ===\n" + cur + "\n\n=== RECENT CHATS ===\n" +
 		strings.Join(parts, "\n"), srcs
 }
 
@@ -226,6 +232,7 @@ func (b *Bridge) distillJob() {
 	gen := b.rulesGen
 	input, srcs := b.buildDistillInputLocked()
 	cur := b.rulesText
+	pinned := b.rulesPinned
 	b.mu.Unlock()
 	defer func() {
 		b.mu.Lock()
@@ -255,11 +262,16 @@ func (b *Bridge) distillJob() {
 		logf("WARN", "rules distill rejected: verbatim quote detected")
 		return
 	}
-	if b.cfg.RulesFile == "" {
+	clean = dropOwnerDuplicates(clean, pinned)
+	if clean == "" || b.cfg.RulesFile == "" {
 		return
 	}
 
-	// Abort if the owner reset/disabled rules or forgot a chat meanwhile.
+	// The file lock keeps owner edits, reset and undo from interleaving with
+	// this write; the generation check discards a result computed from rules
+	// the owner has since edited, reset or disabled.
+	b.rulesFileMu.Lock()
+	defer b.rulesFileMu.Unlock()
 	b.mu.Lock()
 	stillWanted := b.rulesOn() && b.rulesGen == gen && clean != cur
 	b.mu.Unlock()
@@ -272,9 +284,10 @@ func (b *Bridge) distillJob() {
 	}
 	b.mu.Lock()
 	if b.rulesGen != gen {
-		// reset/off/forget landed while the write was in flight: undo it.
+		// off/forget landed while the write was in flight: restore the
+		// previous content (owner edits cannot interleave: they need the lock).
 		b.mu.Unlock()
-		_ = os.Remove(b.cfg.RulesFile)
+		_ = writeOrRemove(b.cfg.RulesFile, cur)
 		return
 	}
 	b.rulesText = clean

@@ -102,6 +102,9 @@ type Bridge struct {
 	rulesPending  int
 	rulesGen      int
 	distillActive bool
+	// rulesFileMu serialises every write of the rules files (owner edits,
+	// distillation, reset, undo, reload) so they cannot clobber each other.
+	rulesFileMu sync.Mutex
 
 	lastPrune time.Time
 	startedAt time.Time
@@ -370,9 +373,19 @@ func (b *Bridge) onBotMessage(m *Message) string {
 	}
 	text := m.body()
 	ctype := m.Chat.Type
-	if ctype == "private" && m.From != nil && m.From.ID == b.cfg.OwnerID && strings.HasPrefix(text, "/") {
-		cmd, args := parseCommand(text)
-		return b.ownerCommand(m.Chat.ID, "", "d:"+strconv.FormatInt(m.Chat.ID, 10), cmd, args)
+	if ctype == "private" && m.From != nil && m.From.ID == b.cfg.OwnerID {
+		if strings.HasPrefix(text, "/") {
+			cmd, args := parseCommand(text)
+			return b.ownerCommand(m.Chat.ID, "", "d:"+strconv.FormatInt(m.Chat.ID, 10), cmd, args)
+		}
+		// The owner's private chat with the bot is a control panel: plain
+		// messages edit the rules instead of being answered like a customer.
+		if strings.TrimSpace(text) == "" {
+			b.sendMsg(m.Chat.ID, "Gửi /rules để xem quy tắc, hoặc nhắn tự nhiên để sửa (ví dụ: \"thêm quy tắc: luôn hỏi số đơn hàng\").", "")
+			return "owner_cmd"
+		}
+		b.startOwnerEdit(m.Chat.ID, "", text)
+		return "owner_edit"
 	}
 	switch ctype {
 	case "group", "supergroup":
@@ -436,57 +449,20 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		b.sysPrompt = p
 		b.mu.Unlock()
 		if b.rulesEnabled {
+			b.rulesFileMu.Lock()
 			b.loadRules()
+			b.rulesFileMu.Unlock()
 		}
 		b.mu.Lock()
 		rlen := runeCount(b.rulesText)
 		b.mu.Unlock()
 		msg = fmt.Sprintf("🔄 Đã nạp lại system prompt (%d ký tự) và rules (%d ký tự).", runeCount(p), rlen)
 	case "/rules":
-		switch strings.TrimSpace(args) {
-		case "reset":
-			b.mu.Lock()
-			b.rulesText = ""
-			b.rulesGen++
-			b.mu.Unlock()
-			if b.cfg.RulesFile != "" {
-				_ = os.Remove(b.cfg.RulesFile)
-			}
-			logf("INFO", "rules reset by owner")
-			msg = "🗑 Đã xoá rules.md (rules.pinned.md của chủ giữ nguyên)."
-		case "off":
-			b.mu.Lock()
-			b.rulesRunOn = false
-			b.rulesGen++
-			b.saveStateLocked()
-			b.mu.Unlock()
-			msg = "🚫 Đã tắt rules AI (rules.pinned.md của chủ vẫn áp dụng)."
-		case "on":
-			b.mu.Lock()
-			b.rulesRunOn = true
-			b.saveStateLocked()
-			b.mu.Unlock()
-			msg = "✅ Đã bật rules."
-		default:
-			b.mu.Lock()
-			rtxt := b.rulesText
-			ptxt := b.rulesPinned
-			state := "bật"
-			if !b.rulesOn() {
-				state = "tắt"
-			}
-			b.mu.Unlock()
-			if rtxt == "" {
-				msg = "rules.md: trống (trạng thái: " + state + ")."
-			} else {
-				msg = "rules.md (" + state + ", " + strconv.Itoa(runeCount(rtxt)) + " ký tự):\n" + rtxt
-			}
-			if ptxt != "" {
-				msg += "\n\nrules.pinned.md (" + strconv.Itoa(runeCount(ptxt)) + " ký tự, AI không sửa):\n" + ptxt
-			}
-			// Two capped files can exceed Telegram's limit; keep the send valid.
-			msg = truncUTF16(msg, telegramUnitLimit)
+		reply, async := b.rulesCommand(chatID, conn, args)
+		if async {
+			return "owner_edit"
 		}
+		msg = reply
 	case "/stats":
 		st := b.snapshotRuntime()
 		b.mu.Lock()
@@ -555,7 +531,9 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			msg += "\nRules: tắt"
 		}
 	default:
-		msg = "Lệnh: /here /away /pause /resume /status /stats /reload /rules [reset|off|on] /forget"
+		msg = "Lệnh: /here /away /pause /resume /status /stats /reload /forget\n" +
+			"Quy tắc: /rules (xem) · /rules add|del|set|edit|undo|reset|off|on\n" +
+			"Hoặc nhắn tự nhiên cho bot để sửa quy tắc."
 	}
 	b.sendMsg(chatID, msg, conn)
 	return "owner_cmd"

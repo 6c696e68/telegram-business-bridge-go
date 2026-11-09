@@ -28,10 +28,17 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
 - Long-term rules (`rules.md`) synthesised by the LLM from conversations and injected into every prompt.
   A prompt policy plus a regex sanitizer block phone numbers, emails, URLs, foreign handles, prices and
   verbatim quotes, so only generic behavioural rules are persisted.
-- `rules.pinned.md`: a second, owner-only rules file. The program reads and injects it verbatim and
-  **never writes it**, so your hand-written rules can never be overwritten by the LLM.
+- `rules.pinned.md`: the owner's own rules. Injected verbatim, never rewritten by the LLM, and binding
+  for it (learned rules may not contradict or repeat them).
+- Edit rules from Telegram: in the private chat with the bot, a plain message such as
+  "bỏ quy tắc về giá, thêm: luôn hỏi số đơn hàng" is applied to the files by the LLM and the new
+  numbered rules are sent back. Exact commands: `/rules` (view, numbered `P#` owner / `A#` learned),
+  `/rules add …`, `/rules del P1 A2`, `/rules set …` (multi-line), `/rules edit <request>`,
+  `/rules undo` (one level). Sensitive data is still rejected from learned rules; your own rules
+  are saved as written.
 - Owner commands (owner only, private chat or a business chat): `/here`, `/away`, `/pause`, `/resume`,
-  `/status`, `/stats`, `/reload`, `/rules [reset|off|on]`, `/forget`.
+  `/status`, `/stats`, `/reload`, `/rules [add|del|set|edit|undo|reset|off|on]`, `/forget`. In the
+  private chat with the bot, the owner's plain messages are rule edits, not customer chats.
 - Bursts are coalesced: consecutive messages within `debounce_ms` produce one reply that answers the
   whole burst, saving tokens and avoiding duplicate answers.
 - Limits: replies per user per hour, daily cap, bounded concurrent LLM calls, LRU chat memory with a

@@ -82,8 +82,9 @@ func TestRulesViewShowsPinned(t *testing.T) {
 	h.b.handleUpdate(dm(testOwner, testOwner, "/rules"))
 	waitSent(t, h, 1)
 	text, _ := h.tg.sends()[0]["text"].(string)
-	if !strings.Contains(text, "rules.pinned.md") || !strings.Contains(text, "không hứa hẹn") {
-		t.Fatalf("rules view missing pinned section: %q", text)
+	if !strings.Contains(text, "Quy tắc của bạn") || !strings.Contains(text, "P1. - Luôn xưng em, không hứa hẹn") ||
+		!strings.Contains(text, "A1. - Rule AI cũ") {
+		t.Fatalf("rules view missing numbered sections: %q", text)
 	}
 }
 
@@ -191,8 +192,10 @@ func TestRulesOffKeepsPinnedRules(t *testing.T) {
 	}
 }
 
-func TestDistillInputExcludesPinned(t *testing.T) {
-	h, _, _ := opsHarness(t)
+// Owner rules are binding for the distiller: it sees them as read-only
+// constraints, and an AI rule that merely repeats one is dropped.
+func TestDistillTreatsOwnerRulesAsBinding(t *testing.T) {
+	h, ai, _ := opsHarness(t)
 	var mu sync.Mutex
 	var distillInputs []string
 	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
@@ -200,7 +203,7 @@ func TestDistillInputExcludesPinned(t *testing.T) {
 			mu.Lock()
 			distillInputs = append(distillInputs, msgs[1].Content)
 			mu.Unlock()
-			return "- Rule AI mới.", true
+			return "- Luôn xưng em, không hứa hẹn thay chủ.\n- Rule AI mới.", true
 		}
 		return "ok", false
 	}
@@ -208,17 +211,19 @@ func TestDistillInputExcludesPinned(t *testing.T) {
 	waitSent(t, h, 1)
 	h.b.handleUpdate(dm(622, 622, "hai"))
 	waitSent(t, h, 2)
-	waitFor(t, "distill ran", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(distillInputs) > 0
+	waitFor(t, "rules rewritten", func() bool {
+		data, _ := os.ReadFile(ai)
+		return strings.Contains(string(data), "Rule AI mới")
 	})
 	mu.Lock()
-	defer mu.Unlock()
-	for _, in := range distillInputs {
-		if strings.Contains(in, "không hứa hẹn thay chủ") {
-			t.Fatal("pinned rules leaked into distiller input")
-		}
+	in := distillInputs[0]
+	mu.Unlock()
+	if !strings.Contains(in, "=== OWNER RULES (binding, read-only) ===") || !strings.Contains(in, "không hứa hẹn thay chủ") {
+		t.Fatalf("distiller must see the owner rules as constraints: %q", in)
+	}
+	data, _ := os.ReadFile(ai)
+	if strings.Contains(string(data), "không hứa hẹn") {
+		t.Fatalf("AI rules must not duplicate owner rules: %q", data)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -55,16 +56,21 @@ func truncReply(s string, maxChars int) string {
 }
 
 // parseCommand splits "/cmd@bot extra words" into ("cmd", "extra words").
+// Line breaks inside args are preserved so multi-line payloads such as
+// "/rules set" keep their layout.
 func parseCommand(text string) (cmd, args string) {
-	f := strings.Fields(text)
-	if len(f) == 0 {
+	t := strings.TrimSpace(text)
+	if t == "" {
 		return "", ""
 	}
-	c := f[0]
+	c, rest := t, ""
+	if i := strings.IndexFunc(t, unicode.IsSpace); i >= 0 {
+		c, rest = t[:i], strings.TrimSpace(t[i:])
+	}
 	if i := strings.IndexByte(c, '@'); i >= 0 {
 		c = c[:i]
 	}
-	return strings.ToLower(c), strings.Join(f[1:], " ")
+	return strings.ToLower(c), rest
 }
 
 // normCmd turns "/Status@my_bot extra" into "/status".
