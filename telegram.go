@@ -26,6 +26,7 @@ type Message struct {
 	BusinessConnectionID string `json:"business_connection_id"`
 	Chat                 Chat   `json:"chat"`
 	From                 *User  `json:"from"`
+	Date                 int64  `json:"date"`
 	Text                 string `json:"text"`
 	Caption              string `json:"caption"`
 	ReplyToMessage       *struct {
@@ -133,12 +134,9 @@ func (t *Telegram) Call(ctx context.Context, method string, params any, out any)
 		return &NetError{Method: method, Kind: netKind(err)}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return &NetError{Method: method, Kind: "read"}
-	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
 	var env tgEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := dec.Decode(&env); err != nil {
 		return &TGError{Method: method, Code: resp.StatusCode, Desc: "bad response"}
 	}
 	if !env.OK {

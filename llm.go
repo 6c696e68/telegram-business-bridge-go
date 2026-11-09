@@ -54,13 +54,10 @@ func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 		return "", &LLMError{Kind: netKind(err)}
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return "", &LLMError{Kind: "read"}
-	}
 	if resp.StatusCode != http.StatusOK {
 		return "", &LLMError{Status: resp.StatusCode, Kind: "http"}
 	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
 	var d struct {
 		Choices []struct {
 			Message struct {
@@ -68,7 +65,7 @@ func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(raw, &d); err != nil || len(d.Choices) == 0 {
+	if err := dec.Decode(&d); err != nil || len(d.Choices) == 0 {
 		return "", &LLMError{Kind: "bad_response"}
 	}
 	return strings.TrimSpace(d.Choices[0].Message.Content), nil

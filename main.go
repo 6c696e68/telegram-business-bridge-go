@@ -52,10 +52,9 @@ func main() {
 		os.Exit(2)
 	}
 
-	tgHTTP := newHTTPClient(16)
-	llmHTTP := newHTTPClient(16)
-	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, tgHTTP),
-		NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, llmHTTP))
+	hc := newHTTPClient(4)
+	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, hc),
+		NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, hc))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

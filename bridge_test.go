@@ -849,3 +849,14 @@ func TestLoadConfigValidation(t *testing.T) {
 		t.Fatalf("defaults/clamps wrong: %+v", cfg)
 	}
 }
+
+func TestMessageDateUnmarshalled(t *testing.T) {
+	var m Message
+	body := []byte(`{"date":1731180000,"chat":{"id":1,"type":"private"},"from":{"id":7},"text":"x"}`)
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Date != 1731180000 {
+		t.Fatalf("date = %d", m.Date)
+	}
+}
