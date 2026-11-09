@@ -214,7 +214,8 @@ Config JSON giữ tương thích (các key cũ nguyên vị trí; `state_file` c
 | `max_stored_chats` | 1000 | ≥ `max_chats` |
 | `max_backlog_min` | 10 | ≥0 |
 | `history_max_chars` | 8000 | ≥200 |
-| `rules_file` | `rules.md` cạnh config ("" = tắt tính năng) | — |
+| `rules_file` | `rules.md` cạnh config | — |
+| `rules_enabled` | true | explicit `false` = tắt tính hoàn toàn |
 | `rules_max_chars` | 4000 | ≥200 |
 | `rules_update_every` | 10 | ≥2 |
 | `rules_allow_url` | false | — |
