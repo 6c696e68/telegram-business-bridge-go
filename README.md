@@ -117,8 +117,22 @@ go to Settings → Telegram Business → Chatbots and add the bot with "Reply to
 
 ## Deploying on a router
 
-`deploy/` ships a systemd unit, a logrotate config and a step-by-step README
-(install, health check, what to watch during the first days).
+`deploy/` ships a systemd unit, a logrotate config, an OpenWrt procd init script
+and a step-by-step README (install, health check, what to watch during the first days).
+
+### OpenWrt (procd)
+
+```sh
+scp tg-bridge root@router:/root/tg-business-bridge/bin/tg-bridge.new
+ssh root@router 'chmod +x /root/tg-business-bridge/bin/tg-bridge.new && \
+  mv /root/tg-business-bridge/bin/tg-bridge.new /root/tg-business-bridge/bin/tg-bridge'
+scp deploy/openwrt/tg-business-bridge.init root@router:/etc/init.d/tg-business-bridge
+ssh root@router 'chmod +x /etc/init.d/tg-business-bridge && \
+  /etc/init.d/tg-business-bridge enable && /etc/init.d/tg-business-bridge restart'
+```
+
+Logs: `logread | grep tg-bridge`. Back up `bin/tg-bridge`, `config.json` and
+`state.json`/`bridge.db` before replacing the binary.
 
 ## Build
 
