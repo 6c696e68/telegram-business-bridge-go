@@ -123,6 +123,7 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 	}
 	b.sysPrompt = p
 	if b.db != nil {
+		b.maybeCompact()
 		b.restoreChats()
 	}
 	return b

@@ -369,7 +369,8 @@ func (b *Bridge) restoreChats() {
 			return nil
 		})
 	})
-	sort.Slice(all, func(i, j int) bool { return all[i].rec.Updated > all[j].rec.Updated })
+	// Push oldest-first so the most recently updated chat ends at the LRU front.
+	sort.Slice(all, func(i, j int) bool { return all[i].rec.Updated < all[j].rec.Updated })
 	cutoff := b.now().Add(-time.Duration(b.cfg.MemoryDays) * 24 * time.Hour).Unix()
 	b.mu.Lock()
 	for _, it := range all {
@@ -395,4 +396,65 @@ func (b *Bridge) restoreChats() {
 	b.mu.Lock()
 	b.evictLocked("")
 	b.mu.Unlock()
+}
+
+// maybeCompact rewrites the DB when it exceeds db_compact_mb (boot only, while
+// nothing else holds the file). Any failure is non-fatal: the old file stays.
+func (b *Bridge) maybeCompact() {
+	if b.db == nil || b.cfg.DBCompactMB <= 0 {
+		return
+	}
+	fi, err := os.Stat(b.cfg.DBFile)
+	if err != nil || fi.Size() < int64(b.cfg.DBCompactMB)<<20 {
+		return
+	}
+	tmp := b.cfg.DBFile + ".compact"
+	_ = os.Remove(tmp)
+	dst, err := bolt.Open(tmp, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		logf("WARN", "db compact: temp open failed")
+		return
+	}
+	if err := bolt.Compact(dst, b.db, 0); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		logf("WARN", "db compact failed: %s", err)
+		return
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmp)
+		logf("WARN", "db compact close failed")
+		return
+	}
+	if err := b.db.Close(); err != nil {
+		logf("WARN", "db compact old close failed")
+		b.reopenDB()
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, b.cfg.DBFile); err != nil {
+		logf("WARN", "db compact rename failed")
+		b.reopenDB()
+		return
+	}
+	if nd, err := bolt.Open(b.cfg.DBFile, 0o600, &bolt.Options{Timeout: 5 * time.Second}); err == nil {
+		b.db = nd
+		sz, _ := os.Stat(b.cfg.DBFile)
+		logf("INFO", "database compacted, size=%d", sz.Size())
+	} else {
+		logf("ERROR", "db reopen after compact failed")
+		b.db = nil
+		b.dbErr = err
+	}
+}
+
+// reopenDB reopens the current DB file after a failed compact swap.
+func (b *Bridge) reopenDB() {
+	nd, err := bolt.Open(b.cfg.DBFile, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		b.db = nil
+		b.dbErr = err
+		return
+	}
+	b.db = nd
 }

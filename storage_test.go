@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 func dbTestConfig(dir string, mut func(*Config)) Config {
@@ -172,5 +177,162 @@ func TestHistoryCharCap(t *testing.T) {
 		if cs.runes > 300 {
 			t.Fatalf("chat %s exceeds rune cap: %d", key, cs.runes)
 		}
+	}
+}
+
+func countBucket(t *testing.T, b *Bridge, name []byte) int {
+	t.Helper()
+	n := 0
+	_ = b.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(name).ForEach(func(_ []byte, _ []byte) error {
+			n++
+			return nil
+		})
+	})
+	return n
+}
+
+func TestRestoreOrderAndCap(t *testing.T) {
+	dir := t.TempDir()
+	cfg := dbTestConfig(dir, func(c *Config) {
+		c.DBFile = filepath.Join(dir, "bridge.db")
+		c.MaxChats = 2
+	})
+	b1 := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	if err := b1.db.Update(func(tx *bolt.Tx) error {
+		ck := tx.Bucket(bucketChats)
+		put := func(k string, updated int64, text string) error {
+			v, _ := json.Marshal(chatRecord{Introduced: true, Updated: updated, Msgs: []ChatMsg{{Role: "user", Content: text}}})
+			return ck.Put([]byte(k), v)
+		}
+		if err := put("d:1", time.Now().Add(-2*time.Hour).Unix(), "old1"); err != nil {
+			return err
+		}
+		if err := put("d:2", time.Now().Add(-1*time.Hour).Unix(), "old2"); err != nil {
+			return err
+		}
+		return put("d:3", time.Now().Unix(), "fresh")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = b1.Close()
+
+	b2 := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	defer func() { _ = b2.Close() }()
+	b2.mu.Lock()
+	if len(b2.chats) != 2 {
+		b2.mu.Unlock()
+		t.Fatalf("restored chats = %d, want 2", len(b2.chats))
+	}
+	for k, v := range b2.chats {
+		t.Logf("chat %s updated=%d msgs=%d", k, v.updated, len(v.msgs))
+	}
+	if cs := b2.chats["d:3"]; cs == nil || len(cs.msgs) == 0 || cs.msgs[0].Content != "fresh" {
+		b2.mu.Unlock()
+		t.Fatalf("newest chat must survive restore")
+	}
+	b2.mu.Unlock()
+	if n := countBucket(t, b2, bucketChats); n != 3 {
+		t.Fatalf("disk records = %d, want 3 (RAM eviction must not drop disk)", n)
+	}
+}
+
+func TestPruneExpiredAndCapStored(t *testing.T) {
+	dir := t.TempDir()
+	cfg := dbTestConfig(dir, func(c *Config) {
+		c.DBFile = filepath.Join(dir, "bridge.db")
+		c.MemoryDays = 1
+		c.MaxChats = 5
+		c.MaxStoredChats = 5
+	})
+	b := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	defer func() { _ = b.Close() }()
+	if err := b.db.Update(func(tx *bolt.Tx) error {
+		ck := tx.Bucket(bucketChats)
+		put := func(k string, updated int64) error {
+			v, _ := json.Marshal(chatRecord{Updated: updated})
+			return ck.Put([]byte(k), v)
+		}
+		if err := put("d:old", time.Now().Add(-48*time.Hour).Unix()); err != nil {
+			return err
+		}
+		for i := 0; i < 7; i++ {
+			if err := put("d:fresh"+string(rune('a'+i)), time.Now().Add(time.Duration(i)*time.Minute).Unix()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b.flushNow()
+	if n := countBucket(t, b, bucketChats); n != 5 {
+		t.Fatalf("stored chats = %d, want 5", n)
+	}
+	hasOld := false
+	_ = b.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketChats).Get([]byte("d:old")) != nil {
+			hasOld = true
+		}
+		return nil
+	})
+	if hasOld {
+		t.Fatal("expired chat must be pruned")
+	}
+}
+
+func TestDBCompactOnBoot(t *testing.T) {
+	dir := t.TempDir()
+	dbp := filepath.Join(dir, "bridge.db")
+	raw, err := bolt.Open(dbp, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Update(func(tx *bolt.Tx) error {
+		ck, e := tx.CreateBucketIfNotExists(bucketChats)
+		if e != nil {
+			return e
+		}
+		_, _ = tx.CreateBucketIfNotExists(bucketMeta)
+		junk := strings.Repeat("z", 8192)
+		for i := 0; i < 300; i++ {
+			r, _ := json.Marshal(chatRecord{Updated: 1, Msgs: []ChatMsg{{Role: "user", Content: junk}}})
+			if e := ck.Put([]byte("d:seed"+strconv.Itoa(i)), r); e != nil {
+				return e
+			}
+		}
+		// delete most rows to leave free pages behind (what compaction reclaims)
+		for i := 50; i < 300; i++ {
+			if e := ck.Delete([]byte("d:seed" + strconv.Itoa(i))); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	before, _ := os.Stat(dbp)
+
+	cfg := dbTestConfig(dir, func(c *Config) {
+		c.DBFile = dbp
+		c.DBCompactMB = 1
+	})
+	b := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	defer func() { _ = b.Close() }()
+	if b.dbErr != nil {
+		t.Fatal(b.dbErr)
+	}
+	after, _ := os.Stat(dbp)
+	bi, ok1 := before.Sys().(*syscall.Stat_t)
+	ai, ok2 := after.Sys().(*syscall.Stat_t)
+	if ok1 && ok2 && bi.Ino == ai.Ino {
+		t.Fatal("compact did not swap in a fresh file (same inode)")
+	}
+	if after.Size() > before.Size() {
+		t.Fatalf("compact must not grow the file: %d -> %d", before.Size(), after.Size())
+	}
+	if countBucket(t, b, bucketChats) == 0 {
+		t.Fatal("compact lost chat records")
 	}
 }
