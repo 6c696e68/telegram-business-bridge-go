@@ -104,7 +104,8 @@ type Bridge struct {
 	distillActive bool
 	// rulesFileMu serialises every write of the rules files (owner edits,
 	// distillation, reset, undo, reload) so they cannot clobber each other.
-	rulesFileMu sync.Mutex
+	rulesFileMu     sync.Mutex
+	ownerEditActive bool // a plain-language rules edit is running (guarded by mu)
 
 	lastPrune time.Time
 	startedAt time.Time

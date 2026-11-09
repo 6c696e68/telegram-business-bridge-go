@@ -961,12 +961,12 @@ func TestRulesInjectionAndDistill(t *testing.T) {
 	if err != nil || !strings.Contains(string(data), "bảo hành") {
 		t.Fatalf("rules file wrong: %v %q", err, data)
 	}
-	h.b.mu.Lock()
-	rt := h.b.rulesText
-	h.b.mu.Unlock()
-	if rt == "" {
-		t.Fatal("rulesText not updated")
-	}
+	// the file is written first, the in-memory copy right after it
+	waitFor(t, "rulesText updated", func() bool {
+		h.b.mu.Lock()
+		defer h.b.mu.Unlock()
+		return h.b.rulesText != ""
+	})
 	// next reply must inject the rules block
 	h.b.handleUpdate(dm(600, 600, "msg3"))
 	waitSent(t, h, 3)
