@@ -17,7 +17,7 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   activity and silences every business chat; `/here` marks you online, `/away` hands over at once.
   Customers who wrote while you were online are remembered and answered by a follow-up sweep
   (every 10 s) once you have been away long enough, unless you answered them yourself or the
-  message is older than `followup_max_min` (default 120). Presence and waiting chats survive restarts.
+  message is older than `followup_max_min` (default 120). Presence and waiting chats survive restarts (with the default `bridge.db` store).
   The Bot API exposes no online/read status, so merely opening a chat cannot be detected — type a
   message or send `/here`.
 - Owner takeover: when the owner types in a chat, that chat also stays silent for `owner_mute_minutes`.

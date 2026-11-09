@@ -51,9 +51,12 @@ type chatState struct {
 	conn       string
 	lastUserAt int64 // unix time of the latest customer message
 	lastUID    int64
-	active     int // reply jobs holding this chat; active chats are never evicted
-	lk         sync.Mutex
-	el         *list.Element
+	// followupAfter is the earliest unix time the sweep may retry this chat,
+	// so a failing LLM is not hammered every tick.
+	followupAfter int64
+	active        int // reply jobs holding this chat; active chats are never evicted
+	lk            sync.Mutex
+	el            *list.Element
 }
 
 type Bridge struct {
@@ -240,7 +243,13 @@ func (b *Bridge) businessConnAllowed(connID string) bool {
 }
 
 // rateOK enforces the daily cap and the per-user hourly cap. Caller holds b.mu.
-func (b *Bridge) rateOK(uid int64) bool {
+func (b *Bridge) rateOK(uid int64) bool { return b.rateAllowLocked(uid, true) }
+
+// rateAllowLocked checks the daily and per-user caps; consume records the hit.
+// Follow-ups check without consuming and consume only after a successful send,
+// so failed or dropped attempts do not burn the customer's quota.
+// Caller holds b.mu.
+func (b *Bridge) rateAllowLocked(uid int64, consume bool) bool {
 	now := b.now()
 	if today := now.Format("2006-01-02"); today != b.day {
 		b.day, b.dayCount, b.repliesSent = today, 0, 0
@@ -265,6 +274,10 @@ func (b *Bridge) rateOK(uid int64) bool {
 	if len(hits) >= b.cfg.PerUserPerHour {
 		b.userHits[uid] = hits
 		return false
+	}
+	if !consume {
+		b.userHits[uid] = hits
+		return true
 	}
 	b.userHits[uid] = append(hits, now)
 	b.dayCount++
@@ -649,7 +662,7 @@ func (b *Bridge) evictLocked(keep string) {
 		var victim *list.Element
 		for el := b.lru.Back(); el != nil; el = el.Prev() {
 			cs := el.Value.(*chatState)
-			if cs.active == 0 && cs.key != keep {
+			if cs.active == 0 && cs.key != keep && !b.followupEligibleLocked(cs) {
 				victim = el
 				break
 			}
@@ -716,6 +729,12 @@ func (b *Bridge) chatKeys() []string {
 // ---------- reply pipeline ----------
 
 func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) {
+	b.replyJobOpt(cs, key, chatID, conn, false)
+}
+
+// replyJobOpt runs one reply. followup marks a sweep-started reply whose rate
+// slot is consumed only once the message is actually delivered.
+func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn string, followup bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			logf("ERROR", "reply job crashed: %v", r)
@@ -786,6 +805,10 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	b.mu.Lock()
 	cs.introduced = true
 	cs.repliedGen = gen
+	cs.followupAfter = 0
+	if followup {
+		b.rateAllowLocked(cs.lastUID, true)
+	}
 	b.repliesSent++
 	b.saveStateLocked()
 	b.rememberLocked(key, "assistant", reply)
@@ -803,6 +826,12 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 			defer b.jobWG.Done()
 			b.distillJob()
 		}()
+	}
+
+	// Persist the delivered reply at once: after a power cut the restored chat
+	// must not look unanswered, or the customer would get the reply twice.
+	if conn != "" {
+		_ = b.flushNow()
 	}
 
 	kind := "direct"
@@ -923,7 +952,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 	// failures instead of exiting, but fail fast on a rejected token.
 	wait := 2 * time.Second
 	for {
-		err := b.tg.Call(ctx, "getMe", nil, &me)
+		gctx, gcancel := context.WithTimeout(ctx, 30*time.Second)
+		err := b.tg.Call(gctx, "getMe", nil, &me)
+		gcancel()
 		if err == nil {
 			break
 		}

@@ -74,6 +74,23 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%dh%02d", int(d/time.Hour), int(d%time.Hour/time.Minute))
 }
 
+// followupRetryAfter spaces out retries for one chat when a follow-up fails.
+const followupRetryAfter = time.Minute
+
+// followupEligibleLocked reports whether a chat is waiting for a follow-up
+// inside the follow-up window. Such chats are protected from LRU eviction.
+// Caller holds b.mu.
+func (b *Bridge) followupEligibleLocked(cs *chatState) bool {
+	if b.cfg.FollowupMaxMin <= 0 || cs.conn == "" || cs.chatID == 0 || cs.lastUserAt == 0 {
+		return false
+	}
+	if !cs.pendingLocked() {
+		return false
+	}
+	window := time.Duration(b.cfg.FollowupMaxMin) * time.Minute
+	return b.now().Sub(time.Unix(cs.lastUserAt, 0)) <= window
+}
+
 // pendingCountLocked counts chats waiting for a follow-up. Caller holds b.mu.
 func (b *Bridge) pendingCountLocked() int {
 	n := 0
@@ -105,20 +122,18 @@ func (b *Bridge) sweepPending() int {
 		return 0
 	}
 	now := b.now()
-	window := time.Duration(b.cfg.FollowupMaxMin) * time.Minute
 	for key, cs := range b.chats {
-		if cs.conn == "" || cs.chatID == 0 || cs.active > 0 || !cs.pendingLocked() {
+		if cs.active > 0 || !b.followupEligibleLocked(cs) {
 			continue
 		}
-		if cs.lastUserAt == 0 || now.Sub(time.Unix(cs.lastUserAt, 0)) > window {
+		if cs.followupAfter > now.Unix() || b.isMutedLocked(key) {
 			continue
 		}
-		if b.isMutedLocked(key) {
+		// Check only; the slot is consumed when the reply is delivered.
+		if !b.rateAllowLocked(cs.lastUID, false) {
 			continue
 		}
-		if !b.rateOK(cs.lastUID) {
-			continue
-		}
+		cs.followupAfter = now.Add(followupRetryAfter).Unix()
 		cs.active++
 		jobs = append(jobs, job{cs, key, cs.chatID, cs.conn})
 	}
@@ -129,7 +144,7 @@ func (b *Bridge) sweepPending() int {
 		b.jobWG.Add(1)
 		go func() {
 			defer b.jobWG.Done()
-			b.replyJob(j.cs, j.key, j.chatID, j.conn)
+			b.replyJobOpt(j.cs, j.key, j.chatID, j.conn, true)
 		}()
 	}
 	if len(jobs) > 0 {

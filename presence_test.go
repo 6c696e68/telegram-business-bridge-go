@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 func businessSends(h *harness) []map[string]any {
@@ -317,4 +320,91 @@ type senderFunc func(ctx context.Context, method string, params any, out any) er
 
 func (f senderFunc) Call(ctx context.Context, method string, params any, out any) error {
 	return f(ctx, method, params, out)
+}
+
+func TestFollowupFailureDoesNotBurnQuotaAndBacksOff(t *testing.T) {
+	h := newHarness(nil)
+	h.b.handleUpdate(biz(testConn, 810, testOwner, "online"))
+	h.b.handleUpdate(biz(testConn, 811, 811, "khách chờ"))
+	h.clock.Advance(31 * time.Minute)
+
+	llmDown := &LLMError{Status: 400, Kind: "http"} // non-retryable: fails at once
+	h.llm.mu.Lock()
+	h.llm.errs = []error{llmDown}
+	h.llm.mu.Unlock()
+	if n := h.b.sweepPending(); n != 1 {
+		t.Fatalf("first follow-up attempt = %d, want 1", n)
+	}
+	waitFor(t, "failed attempt done", func() bool {
+		h.b.mu.Lock()
+		defer h.b.mu.Unlock()
+		return h.b.chats["b:"+testConn+":811"].active == 0
+	})
+	h.b.mu.Lock()
+	day, hits := h.b.dayCount, len(h.b.userHits[811])
+	h.b.mu.Unlock()
+	if day != 0 || hits != 0 {
+		t.Fatalf("a failed follow-up consumed quota: day=%d hits=%d", day, hits)
+	}
+	if n := h.b.sweepPending(); n != 0 {
+		t.Fatalf("retry must back off, started %d", n)
+	}
+	h.clock.Advance(61 * time.Second)
+	if n := h.b.sweepPending(); n != 1 {
+		t.Fatalf("retry after backoff = %d, want 1", n)
+	}
+	waitFor(t, "delivered follow-up", func() bool { return len(businessSends(h)) == 1 })
+	settle()
+	h.b.mu.Lock()
+	day, hits = h.b.dayCount, len(h.b.userHits[811])
+	h.b.mu.Unlock()
+	if day != 1 || hits != 1 {
+		t.Fatalf("a delivered follow-up must consume exactly one slot: day=%d hits=%d", day, hits)
+	}
+}
+
+func TestDeliveredReplyIsPersistedImmediately(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	defer func() { _ = h.b.Close() }()
+	h.b.mu.Lock()
+	h.b.ownerSeen = time.Time{} // owner away
+	h.b.mu.Unlock()
+	h.b.handleUpdate(biz(testConn, 820, 820, "hỏi giá"))
+	waitFor(t, "reply", func() bool { return len(businessSends(h)) == 1 })
+	key := []byte("b:" + testConn + ":820")
+	waitFor(t, "record persisted as answered", func() bool {
+		answered := false
+		_ = h.b.db.View(func(tx *bolt.Tx) error {
+			raw := tx.Bucket(bucketChats).Get(key)
+			if raw == nil {
+				return nil
+			}
+			var rec chatRecord
+			if json.Unmarshal(raw, &rec) == nil && !rec.Pending && len(rec.Msgs) == 2 {
+				answered = true
+			}
+			return nil
+		})
+		return answered
+	})
+}
+
+func TestPendingChatsAreNotEvicted(t *testing.T) {
+	h := newHarness(func(c *Config) { c.MaxChats = 1 })
+	h.b.handleUpdate(biz(testConn, 830, testOwner, "online"))
+	h.b.handleUpdate(biz(testConn, 831, 831, "khách A"))
+	h.b.handleUpdate(biz(testConn, 832, 832, "khách B"))
+	h.b.mu.Lock()
+	_, a := h.b.chats["b:"+testConn+":831"]
+	_, bb := h.b.chats["b:"+testConn+":832"]
+	h.b.mu.Unlock()
+	if !a || !bb {
+		t.Fatalf("waiting chats must not be evicted: A=%v B=%v", a, bb)
+	}
+	h.clock.Advance(31 * time.Minute)
+	if n := h.b.sweepPending(); n != 2 {
+		t.Fatalf("follow-ups = %d, want 2", n)
+	}
+	waitFor(t, "both answered", func() bool { return len(businessSends(h)) == 2 })
 }
