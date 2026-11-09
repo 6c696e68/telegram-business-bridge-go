@@ -35,12 +35,13 @@ type recordMeta struct {
 }
 
 type metaSnapshot struct {
-	Paused   bool
-	Offset   int64
-	Day      string
-	DayCount int
-	ConnOK   map[string]bool
-	RulesOn  bool
+	Paused      bool
+	Offset      int64
+	Day         string
+	DayCount    int
+	ConnOK      map[string]bool
+	RulesOn     bool
+	RepliesSent int
 }
 
 func metaSnapshotFromLocked(b *Bridge) metaSnapshot {
@@ -51,6 +52,7 @@ func metaSnapshotFromLocked(b *Bridge) metaSnapshot {
 	return metaSnapshot{
 		Paused: b.paused, Offset: b.offset, Day: b.day,
 		DayCount: b.dayCount, ConnOK: conn, RulesOn: b.rulesRunOn,
+		RepliesSent: b.repliesSent,
 	}
 }
 
@@ -69,6 +71,7 @@ func writeMetaTx(tx *bolt.Tx, ms metaSnapshot) error {
 	put("offset", strconv.FormatInt(ms.Offset, 10))
 	put("day", ms.Day)
 	put("day_count", strconv.Itoa(ms.DayCount))
+	put("replies_sent", strconv.Itoa(ms.RepliesSent))
 	if c, e := json.Marshal(ms.ConnOK); e == nil {
 		put("conn_ok", string(c))
 	}
@@ -164,6 +167,9 @@ func (b *Bridge) loadMetaDB() {
 		}
 		if v := get("day_count"); v != nil {
 			b.dayCount, _ = strconv.Atoi(string(v))
+		}
+		if v := get("replies_sent"); v != nil {
+			b.repliesSent, _ = strconv.Atoi(string(v))
 		}
 		if v := get("conn_ok"); len(v) > 0 {
 			var m map[string]bool

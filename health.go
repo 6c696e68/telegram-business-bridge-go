@@ -26,16 +26,17 @@ func (b *Bridge) healthHandler() http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":        status,
-			"paused":        st.Paused,
-			"rules_on":      st.RulesOn,
-			"replied_today": st.DayCount,
-			"chats_ram":     st.ChatsRAM,
-			"chats_db":      st.ChatsDB,
-			"db_bytes":      st.DBBytes,
-			"rss_bytes":     st.RSSBytes,
-			"heap_bytes":    st.HeapBytes,
-			"goroutines":    st.Goroutines,
+			"status":         status,
+			"paused":         st.Paused,
+			"rules_on":       st.RulesOn,
+			"messages_today": st.DayCount,
+			"replies_sent":   st.RepliesSent,
+			"chats_ram":      st.ChatsRAM,
+			"chats_db":       st.ChatsDB,
+			"db_bytes":       st.DBBytes,
+			"rss_bytes":      st.RSSBytes,
+			"heap_bytes":     st.HeapBytes,
+			"goroutines":     st.Goroutines,
 		})
 	})
 	return mux

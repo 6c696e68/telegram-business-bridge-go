@@ -121,7 +121,7 @@ func TestRuntimeStatsLine(t *testing.T) {
 	h := newHarness(nil)
 	st := h.b.snapshotRuntime()
 	line := st.line()
-	for _, want := range []string{"rss_mb=", "heap_mb=", "goroutines=", "db_mb=", "chats_ram=", "replied_today="} {
+	for _, want := range []string{"rss_mb=", "heap_mb=", "goroutines=", "db_mb=", "chats_ram=", "messages_today=", "replies_sent="} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("stats line missing %q: %s", want, line)
 		}

@@ -62,18 +62,19 @@ type Bridge struct {
 	botID       int64
 	botUsername string
 
-	mu         sync.Mutex // guards everything below
-	paused     bool
-	day        string
-	dayCount   int
-	connOK     map[string]bool
-	mutedUntil map[string]time.Time
-	userHits   map[int64][]time.Time
-	chats      map[string]*chatState
-	lru        *list.List // front = most recently used
-	llmSem     chan struct{}
-	llmActive  int
-	sysPrompt  string
+	mu          sync.Mutex // guards everything below
+	paused      bool
+	day         string
+	dayCount    int
+	repliesSent int
+	connOK      map[string]bool
+	mutedUntil  map[string]time.Time
+	userHits    map[int64][]time.Time
+	chats       map[string]*chatState
+	lru         *list.List // front = most recently used
+	llmSem      chan struct{}
+	llmActive   int
+	sysPrompt   string
 
 	// storage (storage.go). Only the flush worker/Close writes the DB.
 	db           *bolt.DB
@@ -229,7 +230,7 @@ func (b *Bridge) businessConnAllowed(connID string) bool {
 func (b *Bridge) rateOK(uid int64) bool {
 	now := b.now()
 	if today := now.Format("2006-01-02"); today != b.day {
-		b.day, b.dayCount = today, 0
+		b.day, b.dayCount, b.repliesSent = today, 0, 0
 		b.saveStateLocked()
 	}
 	if b.dayCount >= b.cfg.DailyReplyCap {
@@ -422,15 +423,16 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		st := b.snapshotRuntime()
 		b.mu.Lock()
 		up := b.now().Sub(b.startedAt)
-		b.mu.Unlock()
-		state := "bật"
+		rulesState := "bật"
 		if !b.rulesOn() {
-			state = "tắt"
+			rulesState = "tắt"
 		}
-		msg = fmt.Sprintf("RSS %.1f MB | Heap %.1f MB | Goroutine %d\nDB %.2f MB, %d chat (RAM %d)\nUptime %s | Trả lời hôm nay: %d\nRules: %s (%d ký tự)",
+		sent := b.repliesSent
+		b.mu.Unlock()
+		msg = fmt.Sprintf("RSS %.1f MB | Heap %.1f MB | Goroutine %d\nDB %.2f MB, %d chat (RAM %d)\nUptime %s | Tin hôm nay: %d | Đã trả lời: %d\nRules: %s (%d ký tự)",
 			float64(st.RSSBytes)/(1<<20), float64(st.HeapBytes)/(1<<20), st.Goroutines,
 			float64(st.DBBytes)/(1<<20), st.ChatsDB, st.ChatsRAM,
-			up.Truncate(time.Minute), st.DayCount, state, st.RulesChars)
+			up.Truncate(time.Minute), st.DayCount, sent, rulesState, st.RulesChars)
 	case "/forget":
 		b.mu.Lock()
 		if cs, ok := b.chats[key]; ok {
@@ -468,9 +470,9 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		persist := b.persistent
 		rulesOn := b.rulesOn()
 		rlen := runeCount(b.rulesText)
-		msg = fmt.Sprintf("Trạng thái: %s\nKết nối Business hợp lệ: %d\nĐã trả lời hôm nay: %d/%d\n"+
+		msg = fmt.Sprintf("Trạng thái: %s\nKết nối Business hợp lệ: %d\nTin xử lý hôm nay: %d/%d | Đã trả lời: %d\n"+
 			"Chat đang im lặng (bạn đang tự trả lời): %d\nAI đang xử lý: %d/%d | Chat trong bộ nhớ: %d/%d",
-			status, ok, b.dayCount, b.cfg.DailyReplyCap, muted,
+			status, ok, b.dayCount, b.cfg.DailyReplyCap, b.repliesSent, muted,
 			b.llmActive, b.cfg.MaxConcurrentLLM, b.lru.Len(), b.cfg.MaxChats)
 		b.mu.Unlock()
 		if persist {
@@ -698,6 +700,8 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	b.mu.Lock()
 	cs.introduced = true
 	cs.repliedGen = gen
+	b.repliesSent++
+	b.saveStateLocked()
 	b.rememberLocked(key, "assistant", reply)
 	if b.rulesOn() {
 		b.rulesPending++

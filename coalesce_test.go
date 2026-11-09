@@ -31,6 +31,12 @@ func TestDebounceCoalescesBurst(t *testing.T) {
 	if n := len(h.tg.sends()); n != 1 {
 		t.Fatalf("a burst must yield exactly one reply, got %d", n)
 	}
+	h.b.mu.Lock()
+	accepted, sent := h.b.dayCount, h.b.repliesSent
+	h.b.mu.Unlock()
+	if accepted != 3 || sent != 1 {
+		t.Fatalf("counter drift: accepted=%d replies=%d, want 3/1", accepted, sent)
+	}
 	h.llm.mu.Lock()
 	defer h.llm.mu.Unlock()
 	if len(h.llm.seen) == 0 {
@@ -131,8 +137,12 @@ func TestConfigReplyTuning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DebounceMS != 0 || cfg.MaxTokens != 16 || cfg.Temperature != 2 {
+	if cfg.DebounceMS != 0 || cfg.Temperature != 2 {
 		t.Fatalf("clamps applied wrong: %+v", cfg)
+	}
+	// small explicit caps are raised to the floor; 0 means "use the default"
+	if cfg.MaxTokens != 16 {
+		t.Fatalf("max_tokens floor wrong: %d", cfg.MaxTokens)
 	}
 
 	cfg2, err := loadConfigWithDefaults(t, dir)
@@ -147,4 +157,34 @@ func TestConfigReplyTuning(t *testing.T) {
 
 func writeTemp(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
+}
+
+func TestTakeoverDuringDebounceSuppressesReply(t *testing.T) {
+	h := newHarness(func(c *Config) { c.DebounceMS = 80 })
+	h.b.sleep = func(ctx context.Context, d time.Duration) {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+	}
+	// Customer message starts the debounce; the owner types immediately after.
+	h.b.handleUpdate(biz(testConn, 640, 640, "khách hỏi"))
+	h.b.handleUpdate(biz(testConn, 640, testOwner, "để tôi trả lời"))
+	time.Sleep(200 * time.Millisecond)
+	if n := len(h.tg.sends()); n != 0 {
+		t.Fatalf("reply must be suppressed during takeover, got %d sends", n)
+	}
+	// Still muted: another customer message must not reply.
+	if got := h.b.handleUpdate(biz(testConn, 640, 640, "còn đó không?")); got != "muted" {
+		t.Fatalf("got %q", got)
+	}
+	// Resume clears mutes; the next message gets exactly one reply.
+	h.b.handleUpdate(dm(testOwner, testOwner, "/resume"))
+	settle()
+	h.b.handleUpdate(biz(testConn, 640, 640, "alo"))
+	waitSent(t, h, 1)
+	settle()
+	if n := len(h.tg.sends()); n != 1 {
+		t.Fatalf("expected exactly one reply after resume, got %d", n)
+	}
 }

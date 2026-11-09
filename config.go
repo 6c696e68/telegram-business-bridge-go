@@ -151,7 +151,9 @@ func loadConfig(path string) (Config, error) {
 	if cfg.DebounceMS < 0 {
 		cfg.DebounceMS = 0
 	}
-	if cfg.MaxTokens < 16 {
+	if cfg.MaxTokens <= 0 {
+		cfg.MaxTokens = 1200
+	} else if cfg.MaxTokens < 16 {
 		cfg.MaxTokens = 16
 	}
 	if cfg.Temperature < 0 {
