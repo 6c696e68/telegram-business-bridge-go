@@ -2,7 +2,8 @@
 
 A small, dependency-free Go service that answers Telegram **Business Chatbot**
 messages on behalf of an account owner, using any OpenAI-compatible chat API.
-It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go runs.
+It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
+"Resource usage" below) but runs anywhere Go runs.
 
 > Use it only on accounts you own, and tell your contacts that they are talking to an
 > automated assistant. The bridge already introduces itself on the first reply in each chat.
@@ -18,7 +19,9 @@ It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go run
 - No backlog replay after a restart: messages older than `max_backlog_min` are skipped.
 - Long-term rules (`rules.md`) synthesised by the LLM from conversations and injected into every prompt.
   A prompt policy plus a regex sanitizer block phone numbers, emails, URLs, foreign handles, prices and
-  verbatim quotes, so only generic behavioural rules are persisted; the owner can edit the file by hand.
+  verbatim quotes, so only generic behavioural rules are persisted.
+- `rules.pinned.md`: a second, owner-only rules file. The program reads and injects it verbatim and
+  **never writes it**, so your hand-written rules can never be overwritten by the LLM.
 - Owner commands (owner only, private chat or a business chat): `/pause`, `/resume`, `/status`, `/reload`,
   `/rules [reset|off|on]`, `/forget`.
 - Limits: replies per user per hour, daily cap, bounded concurrent LLM calls, LRU chat memory with a
@@ -30,6 +33,9 @@ It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go run
 - Graceful shutdown: in-flight replies get up to `shutdown_drain_sec` to finish before exit
   (a long LLM call in its thinking phase can still hit the budget; replies in their final
   generating/sending phase are protected).
+- Observability without a monitoring stack: a periodic non-sensitive stats log line
+  (`stats_log_min`, default 60 min: real RSS on Linux, heap, goroutines, DB size, chats,
+  replies today) and an optional loopback JSON endpoint (`health_addr`) serving `/healthz`.
 - Never logs message text, tokens or API keys. Errors are sanitized (the bot token is in the URL, so transport errors carry only a kind).
 - Long-poll loop with backoff, 409 conflict handling, clean shutdown on SIGTERM.
 
@@ -41,6 +47,9 @@ It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go run
 | `telegram.go` | Minimal Telegram Bot API client and update types |
 | `llm.go` | OpenAI-compatible chat client |
 | `storage.go` | bbolt store: meta/chats buckets, flush worker, restore, pruning, compaction |
+| `runtime_stats.go` | Non-sensitive metrics snapshot + periodic stats log |
+| `health.go` | Optional loopback `/healthz` endpoint |
+| `deploy/` | systemd unit, logrotate config, deployment notes |
 | `rules.go` | rules.md loading, sanitizer, distiller job, atomic writes |
 | `bridge.go` | Dispatch, policy, limits, LRU memory, reply pipeline, poll loop |
 | `util.go` | Logging, character and UTF-16 truncation, command parsing |
@@ -89,8 +98,11 @@ it can be deleted. Only one process may open the database at a time.
 | `rules_max_chars` | 4000 | hard cap for the file and the injected block |
 | `rules_update_every` | 10 | synthesise after every N successful replies |
 | `rules_allow_url` | false | allow URLs in rules (blocked by default) |
+| `rules_pinned_file` | `rules.pinned.md` next to the config | owner-only rules; never written by the program |
 | `fallback_models` | `[]` | model names tried after the primary on 429/5xx |
 | `shutdown_drain_sec` | 15 | seconds to wait for in-flight replies on SIGTERM (0 = off) |
+| `stats_log_min` | 60 | minutes between non-sensitive stats log lines (0 = off) |
+| `health_addr` | `""` (off) | loopback address for `GET /healthz`, e.g. `127.0.0.1:8099` |
 
 The LLM rewrites the whole file (`UNCHANGED` means "no change"). Phone numbers (including
 spaced ones), emails, URLs, foreign Telegram handles, money amounts, IDs, secrets and
@@ -102,6 +114,11 @@ best-effort guard (strict prompt + regex + quote detector), not a hard guarantee
 
 Telegram setup: in BotFather enable Business Mode for the bot, then in the owner's Telegram
 go to Settings → Telegram Business → Chatbots and add the bot with "Reply to messages".
+
+## Deploying on a router
+
+`deploy/` ships a systemd unit, a logrotate config and a step-by-step README
+(install, health check, what to watch during the first days).
 
 ## Build
 

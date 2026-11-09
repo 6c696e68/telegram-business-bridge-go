@@ -38,8 +38,11 @@ type Config struct {
 	HistoryMaxChars  int      `json:"history_max_chars"`
 	RulesEnabled     bool     `json:"rules_enabled"`
 	RulesFile        string   `json:"rules_file"`
+	RulesPinnedFile  string   `json:"rules_pinned_file"`
 	RulesMaxChars    int      `json:"rules_max_chars"`
 	RulesUpdateEvery int      `json:"rules_update_every"`
+	StatsLogMin      int      `json:"stats_log_min"`
+	HealthAddr       string   `json:"health_addr"`
 	RulesAllowURL    bool     `json:"rules_allow_url"`
 	DBCompactMB      int      `json:"db_compact_mb"`
 }
@@ -59,6 +62,7 @@ func defaultConfig() Config {
 		MaxChats:         500,
 		LLMRetries:       2,
 		ShutdownDrainSec: 15,
+		StatsLogMin:      60,
 		FlushSec:         30,
 		MemoryDays:       7,
 		MaxStoredChats:   1000,
@@ -102,6 +106,9 @@ func loadConfig(path string) (Config, error) {
 	if cfg.RulesFile == "" {
 		cfg.RulesFile = filepath.Join(filepath.Dir(path), "rules.md")
 	}
+	if cfg.RulesPinnedFile == "" {
+		cfg.RulesPinnedFile = filepath.Join(filepath.Dir(path), "rules.pinned.md")
+	}
 	if cfg.TelegramBase == "" {
 		cfg.TelegramBase = "https://api.telegram.org"
 	}
@@ -132,6 +139,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.ShutdownDrainSec < 0 {
 		cfg.ShutdownDrainSec = 0
+	}
+	if cfg.StatsLogMin < 0 {
+		cfg.StatsLogMin = 0
 	}
 	return cfg, nil
 }

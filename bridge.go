@@ -87,6 +87,7 @@ type Bridge struct {
 	rulesEnabled  bool
 	rulesRunOn    bool
 	rulesText     string
+	rulesPinned   string
 	rulesPending  int
 	rulesGen      int
 	distillActive bool
@@ -379,7 +380,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 				_ = os.Remove(b.cfg.RulesFile)
 			}
 			logf("INFO", "rules reset by owner")
-			msg = "🗑 Đã xoá rules.md."
+			msg = "🗑 Đã xoá rules.md (rules.pinned.md của chủ giữ nguyên)."
 		case "off":
 			b.mu.Lock()
 			b.rulesRunOn = false
@@ -396,6 +397,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		default:
 			b.mu.Lock()
 			rtxt := b.rulesText
+			ptxt := b.rulesPinned
 			state := "bật"
 			if !b.rulesOn() {
 				state = "tắt"
@@ -405,6 +407,9 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 				msg = "rules.md: trống (trạng thái: " + state + ")."
 			} else {
 				msg = "rules.md (" + state + ", " + strconv.Itoa(runeCount(rtxt)) + " ký tự):\n" + rtxt
+			}
+			if ptxt != "" {
+				msg += "\n\nrules.pinned.md (" + strconv.Itoa(runeCount(ptxt)) + " ký tự, AI không sửa):\n" + ptxt
 			}
 		}
 	case "/forget":

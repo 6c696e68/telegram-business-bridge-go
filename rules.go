@@ -118,28 +118,47 @@ func writeRulesAtomic(path, text string) error {
 	return os.Rename(tmp, path)
 }
 
-// loadRules reads the owner-editable rules file into memory (capped).
+// loadRules reads both the AI-maintained rules file and the owner-pinned file
+// into memory (each capped). The pinned file is never written by the program.
 func (b *Bridge) loadRules() {
-	if !b.rulesEnabled || b.cfg.RulesFile == "" {
+	if !b.rulesEnabled {
 		return
 	}
-	data, err := os.ReadFile(b.cfg.RulesFile)
-	if err == nil {
-		b.mu.Lock()
-		b.rulesText = truncRunes(string(data), b.cfg.RulesMaxChars)
-		b.mu.Unlock()
+	var ai, pinned string
+	if b.cfg.RulesFile != "" {
+		if data, err := os.ReadFile(b.cfg.RulesFile); err == nil {
+			ai = truncRunes(string(data), b.cfg.RulesMaxChars)
+		}
 	}
+	if b.cfg.RulesPinnedFile != "" {
+		if data, err := os.ReadFile(b.cfg.RulesPinnedFile); err == nil {
+			pinned = truncRunes(string(data), b.cfg.RulesMaxChars)
+		}
+	}
+	b.mu.Lock()
+	b.rulesText = ai
+	b.rulesPinned = pinned
+	b.mu.Unlock()
 }
 
 // rulesOn reports whether rules are active at runtime.
 func (b *Bridge) rulesOn() bool { return b.rulesEnabled && b.rulesRunOn }
 
-// rulesNoteLocked returns the prompt block appended to the system prompt.
+// rulesNoteLocked returns the prompt blocks appended to the system prompt.
+// The owner-pinned block is injected verbatim and is never synthesised away.
 func (b *Bridge) rulesNoteLocked() string {
-	if !b.rulesOn() || b.rulesText == "" {
+	if !b.rulesOn() {
 		return ""
 	}
-	return rulesHeader + truncRunes(b.rulesText, b.cfg.RulesMaxChars)
+	note := ""
+	if b.rulesText != "" {
+		note += rulesHeader + truncRunes(b.rulesText, b.cfg.RulesMaxChars)
+	}
+	if b.rulesPinned != "" {
+		note += "\n\n[Owner rules — always follow, never modify]\n" +
+			truncRunes(b.rulesPinned, b.cfg.RulesMaxChars)
+	}
+	return note
 }
 
 const distillSystemPrompt = "You maintain the long-term rules file for an automatic Telegram assistant.\n" +

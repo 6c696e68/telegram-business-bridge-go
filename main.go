@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 
 func newHTTPClient(maxIdle int) *http.Client {
 	tr := &http.Transport{
@@ -62,6 +62,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go b.statsLoop(ctx)
+	go b.startHealth(ctx, cfg.HealthAddr)
 
 	flushDone := make(chan struct{})
 	go func() {

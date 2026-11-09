@@ -1,0 +1,28 @@
+[Unit]
+Description=Telegram Business auto-reply bridge (LLM)
+Documentation=https://github.com/6c696e68/telegram-business-bridge-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgbridge
+Group=tgbridge
+WorkingDirectory=/opt/tg-bridge
+ExecStart=/opt/tg-bridge/tg-bridge -config /opt/tg-bridge/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=25s
+StandardOutput=append:/opt/tg-bridge/bridge.log
+StandardError=append:/opt/tg-bridge/bridge.log
+
+# Keep the service small and contained. The bridge needs write access only to
+# its own directory (config.json, bridge.db, rules files, log).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tg-bridge
+
+[Install]
+WantedBy=multi-user.target
