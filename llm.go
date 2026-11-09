@@ -216,11 +216,15 @@ func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature 
 				return nil, err
 			}
 		} else {
-			buf.WriteString(`[{"type":"text","text":`)
-			if err := str(m.Content); err != nil {
-				return nil, err
+			if m.Content != "" { // mirrors the "text,omitempty" form
+				buf.WriteString(`[{"type":"text","text":`)
+				if err := str(m.Content); err != nil {
+					return nil, err
+				}
+				buf.WriteByte('}')
+			} else {
+				buf.WriteString(`[{"type":"text"}`)
 			}
-			buf.WriteByte('}')
 			for _, u := range m.Images {
 				buf.WriteString(`,{"type":"image_url","image_url":{"url":`)
 				if jsonSafe(u) {

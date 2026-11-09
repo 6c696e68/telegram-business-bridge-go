@@ -30,8 +30,16 @@ const (
 // markerNeutral rewrites text that imitates the bridge's own markers, so a
 // customer cannot forge "[Đang trả lời tin nhắn của chủ: …]".
 func markerNeutral(s string) string {
-	s = strings.ReplaceAll(s, "[Đang trả lời", "(Đang trả lời")
-	return strings.ReplaceAll(s, "[Ảnh]", "(Ảnh)")
+	for _, pair := range [][2]string{
+		{"[Đang trả lời", "(Đang trả lời"},
+		{"[Ảnh]", "(Ảnh)"},
+		{"[Gửi một ảnh]", "(Gửi một ảnh)"},
+		{"[Sticker ", "(Sticker "},
+		{"[nội dung không phải văn bản]", "(nội dung không phải văn bản)"},
+	} {
+		s = strings.ReplaceAll(s, pair[0], pair[1])
+	}
+	return s
 }
 
 // senderLabel names the author of a replied-to message for the model.
@@ -153,12 +161,12 @@ func (b *Bridge) downloadImages(ctx context.Context, ids []string) []string {
 			logf("WARN", "image download skipped: %v", err)
 			continue
 		}
-		total += int64(len(data))
 		mime := http.DetectContentType(data)
 		if !strings.HasPrefix(mime, "image/") {
 			logf("WARN", "image download skipped: not an image (%s)", mime)
 			continue
 		}
+		total += int64(len(data)) // only accepted images use the budget
 		urls = append(urls, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data))
 	}
 	return urls
@@ -186,12 +194,17 @@ func hasImages(msgs []ChatMsg) bool {
 	return false
 }
 
-var imageErrorHints = []string{"image", "vision", "multimodal", "multi-modal", "image_url", "content type", "content part", "unsupported content"}
+// nonImageErrorHints name failures a text-only retry cannot fix (overlong
+// context, quota, auth, missing model), so they must not cost a second call.
+var nonImageErrorHints = []string{
+	"context length", "maximum context", "context window", "max_tokens", "max tokens",
+	"token limit", "too many tokens", "insufficient_quota", "quota", "billing",
+	"authentication", "api key", "invalid_api_key", "model_not_found", "no such model",
+}
 
-// visionRejected reports a provider error that means "this model or payload
-// cannot take images". 413/415 always qualify; 400/404/422 only when the
-// error body points at images (or is empty, so nothing contradicts it), to
-// avoid paying twice for unrelated failures such as an overlong context.
+// visionRejected reports whether a failed image request is worth retrying
+// without the images. 413/415 always are; 400/404/422 are, unless the error
+// body names a text-side cause a retry cannot fix.
 func visionRejected(err error) bool {
 	var le *LLMError
 	if !errors.As(err, &le) || le.Kind != "http" {
@@ -204,11 +217,12 @@ func visionRejected(err error) bool {
 		if strings.TrimSpace(le.detail) == "" {
 			return true
 		}
-		for _, h := range imageErrorHints {
+		for _, h := range nonImageErrorHints {
 			if strings.Contains(le.detail, h) {
-				return true
+				return false
 			}
 		}
+		return true
 	}
 	return false
 }
