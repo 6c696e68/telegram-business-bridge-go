@@ -124,6 +124,9 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		p = b.subst(defaultPrompt)
 	}
 	b.sysPrompt = p
+	if b.rulesEnabled {
+		b.loadRules()
+	}
 	if b.db != nil {
 		b.maybeCompact()
 		b.restoreChats()
@@ -293,7 +296,8 @@ func (b *Bridge) onBotMessage(m *Message) string {
 	text := m.body()
 	ctype := m.Chat.Type
 	if ctype == "private" && m.From != nil && m.From.ID == b.cfg.OwnerID && strings.HasPrefix(text, "/") {
-		return b.ownerCommand(m.Chat.ID, normCmd(text))
+		cmd, args := parseCommand(text)
+		return b.ownerCommand(m.Chat.ID, "", "d:"+strconv.FormatInt(m.Chat.ID, 10), cmd, args)
 	}
 	switch ctype {
 	case "group", "supergroup":
@@ -319,7 +323,7 @@ func (b *Bridge) addressed(m *Message, text string) bool {
 		strings.Contains(strings.ToLower(text), "@"+strings.ToLower(b.botUsername))
 }
 
-func (b *Bridge) ownerCommand(chatID int64, cmd string) string {
+func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string {
 	var msg string
 	switch cmd {
 	case "/pause":
@@ -344,7 +348,50 @@ func (b *Bridge) ownerCommand(chatID int64, cmd string) string {
 		b.mu.Lock()
 		b.sysPrompt = p
 		b.mu.Unlock()
-		msg = fmt.Sprintf("🔄 Đã nạp lại system prompt (%d ký tự).", runeCount(p))
+		if b.rulesEnabled {
+			b.loadRules()
+		}
+		b.mu.Lock()
+		rlen := runeCount(b.rulesText)
+		b.mu.Unlock()
+		msg = fmt.Sprintf("🔄 Đã nạp lại system prompt (%d ký tự) và rules (%d ký tự).", runeCount(p), rlen)
+	case "/rules":
+		switch strings.TrimSpace(args) {
+		case "reset":
+			b.mu.Lock()
+			b.rulesText = ""
+			b.mu.Unlock()
+			if b.cfg.RulesFile != "" {
+				_ = os.Remove(b.cfg.RulesFile)
+			}
+			logf("INFO", "rules reset by owner")
+			msg = "🗑 Đã xoá rules.md."
+		case "off":
+			b.mu.Lock()
+			b.rulesRunOn = false
+			b.saveStateLocked()
+			b.mu.Unlock()
+			msg = "🚫 Đã tắt rules (không tổng hợp, không chèn)."
+		case "on":
+			b.mu.Lock()
+			b.rulesRunOn = true
+			b.saveStateLocked()
+			b.mu.Unlock()
+			msg = "✅ Đã bật rules."
+		default:
+			b.mu.Lock()
+			rtxt := b.rulesText
+			state := "bật"
+			if !b.rulesOn() {
+				state = "tắt"
+			}
+			b.mu.Unlock()
+			if rtxt == "" {
+				msg = "rules.md: trống (trạng thái: " + state + ")."
+			} else {
+				msg = "rules.md (" + state + ", " + strconv.Itoa(runeCount(rtxt)) + " ký tự):\n" + rtxt
+			}
+		}
 	case "/status":
 		b.mu.Lock()
 		ok := 0
@@ -370,9 +417,9 @@ func (b *Bridge) ownerCommand(chatID int64, cmd string) string {
 			b.llmActive, b.cfg.MaxConcurrentLLM, b.lru.Len(), b.cfg.MaxChats)
 		b.mu.Unlock()
 	default:
-		msg = "Lệnh: /pause /resume /status /reload"
+		msg = "Lệnh: /pause /resume /status /reload /rules [reset|off|on]"
 	}
-	b.sendMsg(chatID, msg, "")
+	b.sendMsg(chatID, msg, conn)
 	return "owner_cmd"
 }
 
@@ -529,7 +576,7 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	if cs.introduced {
 		note = introDone
 	}
-	system := b.sysPrompt + b.subst(note)
+	system := b.sysPrompt + b.subst(note) + b.rulesNoteLocked()
 	msgs := make([]ChatMsg, 0, len(cs.msgs)+1)
 	msgs = append(msgs, ChatMsg{Role: "system", Content: system})
 	msgs = append(msgs, cs.msgs...)
@@ -562,10 +609,21 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	if !b.sendMsg(chatID, reply, conn) {
 		return
 	}
+	fire := false
 	b.mu.Lock()
 	b.rememberLocked(key, "assistant", reply)
 	cs.introduced = true
+	if b.rulesOn() {
+		b.rulesPending++
+		if b.rulesPending >= b.cfg.RulesUpdateEvery {
+			b.rulesPending = 0
+			fire = true
+		}
+	}
 	b.mu.Unlock()
+	if fire {
+		go b.distillJob()
+	}
 
 	kind := "direct"
 	if conn != "" {

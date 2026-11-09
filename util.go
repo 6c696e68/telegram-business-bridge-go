@@ -54,17 +54,23 @@ func truncReply(s string, maxChars int) string {
 	return truncUTF16(truncRunes(s, maxChars), telegramUnitLimit)
 }
 
-// normCmd turns "/Status@my_bot extra" into "/status".
-func normCmd(text string) string {
+// parseCommand splits "/cmd@bot extra words" into ("cmd", "extra words").
+func parseCommand(text string) (cmd, args string) {
 	f := strings.Fields(text)
 	if len(f) == 0 {
-		return ""
+		return "", ""
 	}
 	c := f[0]
 	if i := strings.IndexByte(c, '@'); i >= 0 {
 		c = c[:i]
 	}
-	return strings.ToLower(c)
+	return strings.ToLower(c), strings.Join(f[1:], " ")
+}
+
+// normCmd turns "/Status@my_bot extra" into "/status".
+func normCmd(text string) string {
+	c, _ := parseCommand(text)
+	return c
 }
 
 func tail6(s string) string {

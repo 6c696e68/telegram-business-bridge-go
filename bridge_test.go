@@ -97,6 +97,9 @@ func (f *fakeTG) count(method string) int {
 type fakeLLM struct {
 	mu       sync.Mutex
 	reply    string
+	replies  []string
+	callIdx  int
+	fn       func(msgs []ChatMsg) (string, bool)
 	errs     []error
 	seen     [][]ChatMsg
 	delay    time.Duration
@@ -138,6 +141,16 @@ func (f *fakeLLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 		e := f.errs[0]
 		f.errs = f.errs[1:]
 		return "", e
+	}
+	if f.fn != nil {
+		if out, ok := f.fn(msgs); ok {
+			return out, nil
+		}
+	}
+	if f.callIdx < len(f.replies) {
+		out := f.replies[f.callIdx]
+		f.callIdx++
+		return out, nil
 	}
 	return f.reply, nil
 }
@@ -891,5 +904,146 @@ func TestBacklogDisabledAllowsOldMessages(t *testing.T) {
 	old.BusinessMessage.Date = h.clock.Now().Add(-24 * time.Hour).Unix()
 	if got := h.b.handleUpdate(old); got != "queued" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// ---------- rules loop ----------
+
+func rulesHarness(t *testing.T, mut func(*Config)) (*harness, string) {
+	dir := t.TempDir()
+	rf := filepath.Join(dir, "rules.md")
+	if mut == nil {
+		mut = func(*Config) {}
+	}
+	h := newHarness(func(c *Config) {
+		c.RulesFile = rf
+		c.RulesUpdateEvery = 2
+		mut(c)
+	})
+	return h, rf
+}
+
+func TestRulesInjectionAndDistill(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			return "- Khách hay hỏi về bảo hành sản phẩm.", true
+		}
+		return "Dạ em trả lời", false
+	}
+	h.b.handleUpdate(dm(600, 600, "msg1"))
+	waitSent(t, h, 1)
+	h.b.handleUpdate(dm(600, 600, "msg2"))
+	waitSent(t, h, 2)
+	waitFor(t, "rules file", func() bool { _, err := os.Stat(rf); return err == nil })
+	data, err := os.ReadFile(rf)
+	if err != nil || !strings.Contains(string(data), "bảo hành") {
+		t.Fatalf("rules file wrong: %v %q", err, data)
+	}
+	h.b.mu.Lock()
+	rt := h.b.rulesText
+	h.b.mu.Unlock()
+	if rt == "" {
+		t.Fatal("rulesText not updated")
+	}
+	// next reply must inject the rules block
+	h.b.handleUpdate(dm(600, 600, "msg3"))
+	waitSent(t, h, 3)
+	h.llm.mu.Lock()
+	injected := false
+	for _, seen := range h.llm.seen {
+		if len(seen) > 0 && strings.Contains(seen[0].Content, "[Long-term rules]") {
+			injected = true
+			break
+		}
+	}
+	h.llm.mu.Unlock()
+	if !injected {
+		t.Fatal("rules block not injected into system prompt")
+	}
+}
+
+func TestRulesDistillWaitsForThreshold(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			return "- Rule.", true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(601, 601, "one"))
+	waitSent(t, h, 1)
+	settle()
+	if _, err := os.Stat(rf); err == nil {
+		t.Fatal("distill must not fire before rules_update_every replies")
+	}
+}
+
+func TestRulesOffStopsDistill(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			return "- Rule.", true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules off"))
+	settle()
+	for i := 0; i < 4; i++ {
+		h.b.handleUpdate(dm(602, 602, "x"))
+	}
+	settle()
+	if _, err := os.Stat(rf); err == nil {
+		t.Fatal("distill must not run while rules are off")
+	}
+	h.b.mu.Lock()
+	on := h.b.rulesOn()
+	h.b.mu.Unlock()
+	if on {
+		t.Fatal("rulesOn must be false after /rules off")
+	}
+}
+
+func TestRulesVerbatimQuoteRejected(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			return "- " + strings.Repeat("A", 40), true
+		}
+		return "ok", false
+	}
+	longText := strings.Repeat("A", 120) + " " + strings.Repeat("B", 120)
+	h.b.handleUpdate(dm(603, 603, longText))
+	waitSent(t, h, 1)
+	h.b.handleUpdate(dm(603, 603, "second"))
+	waitSent(t, h, 2)
+	settle()
+	if _, err := os.Stat(rf); err == nil {
+		t.Fatal("verbatim quote must not be persisted")
+	}
+}
+
+func TestRulesViewAndReset(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	if err := os.WriteFile(rf, []byte("- Rule A"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.b.loadRules()
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules"))
+	waitSent(t, h, 1)
+	sends := h.tg.sends()
+	if !strings.Contains(sends[0]["text"].(string), "Rule A") {
+		t.Fatalf("rules view missing content: %v", sends[0]["text"])
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules reset"))
+	waitSent(t, h, 2)
+	if _, err := os.Stat(rf); err == nil {
+		t.Fatal("rules reset must delete the file")
+	}
+	h.b.mu.Lock()
+	rt := h.b.rulesText
+	h.b.mu.Unlock()
+	if rt != "" {
+		t.Fatalf("rulesText must be cleared, got %q", rt)
 	}
 }
