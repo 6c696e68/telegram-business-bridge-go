@@ -15,6 +15,36 @@ import (
 type ChatMsg struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images are data: URLs sent to vision models with this message only.
+	// They are never stored in history or on disk.
+	Images []string `json:"-"`
+}
+
+// MarshalJSON emits the plain OpenAI form, or the multimodal content array
+// when images are attached.
+func (m ChatMsg) MarshalJSON() ([]byte, error) {
+	if len(m.Images) == 0 {
+		return json.Marshal(struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{m.Role, m.Content})
+	}
+	type urlPart struct {
+		URL string `json:"url"`
+	}
+	type part struct {
+		Type     string   `json:"type"`
+		Text     string   `json:"text,omitempty"`
+		ImageURL *urlPart `json:"image_url,omitempty"`
+	}
+	parts := []part{{Type: "text", Text: m.Content}}
+	for _, u := range m.Images {
+		parts = append(parts, part{Type: "image_url", ImageURL: &urlPart{URL: u}})
+	}
+	return json.Marshal(struct {
+		Role    string `json:"role"`
+		Content []part `json:"content"`
+	}{m.Role, parts})
 }
 
 // LLMError never contains the API key or URL. Kind is one of:

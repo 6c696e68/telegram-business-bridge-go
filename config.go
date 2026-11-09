@@ -31,6 +31,7 @@ type Config struct {
 	FallbackModels   []string `json:"fallback_models"`
 	ShutdownDrainSec int      `json:"shutdown_drain_sec"`
 	DebounceMS       int      `json:"debounce_ms"`
+	Vision           bool     `json:"vision"`
 	OwnerAwayMinutes int      `json:"owner_away_minutes"`
 	FollowupMaxMin   int      `json:"followup_max_min"`
 	MaxTokens        int      `json:"max_tokens"`
@@ -68,6 +69,7 @@ func defaultConfig() Config {
 		LLMRetries:       2,
 		ShutdownDrainSec: 15,
 		DebounceMS:       700,
+		Vision:           true,
 		OwnerAwayMinutes: 30,
 		FollowupMaxMin:   0, // opt-in: answering messages sent while the owner was online
 		MaxTokens:        1200,

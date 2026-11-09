@@ -263,7 +263,14 @@ func (b *Bridge) saveStateLocked() {
 // flushNow writes pending meta/chats, deletions and pruning in one
 // transaction. It is the only writer of the database besides boot-time setup.
 // Pending state is restored on failure so nothing is silently lost.
-func (b *Bridge) flushNow() error {
+func (b *Bridge) flushNow() error { return b.flushNowOpts(true) }
+
+// flushState persists meta and chat records but leaves transcript lines
+// queued for the next ticker flush: transcripts are rewritten whole, so
+// batching them saves flash writes. Used on the per-update and per-reply paths.
+func (b *Bridge) flushState() error { return b.flushNowOpts(false) }
+
+func (b *Bridge) flushNowOpts(withTranscripts bool) error {
 	b.flushMu.Lock()
 	defer b.flushMu.Unlock()
 	if b.db == nil {
@@ -281,8 +288,11 @@ func (b *Bridge) flushNow() error {
 	b.pendingChats = map[string]chatRecord{}
 	del := b.deletedChats
 	b.deletedChats = map[string]struct{}{}
-	trs := b.trPending
-	b.trPending = map[string]trPending{}
+	var trs map[string]trPending
+	if withTranscripts {
+		trs = b.trPending
+		b.trPending = map[string]trPending{}
+	}
 	b.mu.Unlock()
 
 	err := b.db.Update(func(tx *bolt.Tx) error {

@@ -98,6 +98,10 @@ func (b *Bridge) recordTranscriptLocked(key, role, title, text string) {
 			p.title = title
 		}
 		p.entries = append(p.entries, e)
+		// bounded even if flushes keep failing (disk full, read-only mount)
+		if over := len(p.entries) - transcriptKeep; over > 0 {
+			p.entries = append([]trEntry(nil), p.entries[over:]...)
+		}
 		b.trPending[key] = p
 		return
 	}
@@ -347,7 +351,9 @@ func (b *Bridge) summaryJob(key string) {
 	ownerChat := b.cfg.OwnerID
 	rec, ok := b.loadTranscript(key)
 	if !ok {
-		b.sendMsg(ownerChat, "Chưa có tin nhắn nào được lưu cho chat này (bot chỉ lưu tin từ khi bản này chạy).", "")
+		if !b.sendMsg(ownerChat, "Chưa có tin nhắn nào được lưu cho chat này (bot chỉ lưu tin từ khi bản này chạy).", "") {
+			logf("WARN", "summary: cannot deliver to the owner's private chat (send /start to the bot once)")
+		}
 		return
 	}
 	var sb strings.Builder
@@ -377,5 +383,7 @@ func (b *Bridge) summaryJob(key string) {
 	b.mu.Unlock()
 	head := fmt.Sprintf("📝 Tóm tắt chat với %s (%d tin, tin cũ nhất %s):\n\n",
 		chatLabel(key, rec.Title), len(rec.Msgs), agoText(now, rec.Msgs[0].T))
-	b.sendMsg(ownerChat, truncUTF16(head+strings.TrimSpace(out), telegramUnitLimit), "")
+	if !b.sendMsg(ownerChat, truncUTF16(head+strings.TrimSpace(out), telegramUnitLimit), "") {
+		logf("WARN", "summary: cannot deliver to the owner's private chat (send /start to the bot once)")
+	}
 }

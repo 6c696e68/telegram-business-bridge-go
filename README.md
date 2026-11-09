@@ -38,12 +38,21 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   `/rules add …`, `/rules del P1 A2`, `/rules set …` (multi-line), `/rules edit <request>`,
   `/rules undo` (one level). Sensitive data is still rejected from learned rules; your own rules
   are saved as written.
+- Images: photos and images sent as files (customers and the owner's private chat) are downloaded and
+  sent to the model with the message (largest size ≤1280 px / 2 MB, up to 3 per reply). Images are
+  never stored: history, transcripts and the DB keep only "[Ảnh] caption". If the model rejects images,
+  the bot retries once without them and still answers. `vision: false` turns this off.
+- Replies: when a message replies to another one, the model sees
+  `[Đang trả lời tin nhắn của khách/chủ/trợ lý AI: "…"]` (the selected quote if any) and the replied
+  photo, so "còn màu đen không?" is understood in context.
 - `/tomtat` (alias `/summary`): summarise a conversation from its last 100 messages (customer, owner and
   bot). In the private chat with the bot, `/tomtat` lists recent chats and `/tomtat 2` summarises one;
   typed inside a customer chat it summarises that chat. The summary is always sent to the owner's
   private chat, never to the customer (the command message itself is visible in that chat). The Bot API
-  cannot read history, so the bridge keeps its own log: on disk only, 500 characters per message,
+  cannot read history, so the bridge keeps its own log (written on the flush ticker, not per message):
+  on disk only, 500 characters per message,
   20,000 per chat, expiring with `memory_days`, deleted by `/forget`; group chats are not logged.
+  The owner must have sent /start to the bot once so it can deliver summaries privately.
 - Owner commands (owner only, private chat or a business chat): `/here`, `/away`, `/tomtat`, `/pause`, `/resume`,
   `/status`, `/stats`, `/reload`, `/rules [add|del|set|edit|undo|reset|off|on]`, `/forget`. In the
   private chat with the bot, the owner talks to an assistant that can also edit the rules.
@@ -131,6 +140,7 @@ it can be deleted. Only one process may open the database at a time.
 | `owner_away_minutes` | 30 | owner inactivity required before the bot answers business chats (0 = always answer) |
 | `followup_max_min` | 0 (off) | opt-in: answer messages sent while you were online, up to this age in minutes |
 | `max_tokens` | 1200 | completion token cap per reply |
+| `vision` | true | send images to the model (falls back to text if the model rejects them) |
 | `temperature` | 0 | sampling temperature; 0 keeps the provider default |
 | `health_addr` | `""` (off) | loopback address for `GET /healthz`, e.g. `127.0.0.1:8099` |
 

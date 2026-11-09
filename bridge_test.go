@@ -35,10 +35,38 @@ type tgCall struct {
 }
 
 type fakeTG struct {
-	mu       sync.Mutex
-	calls    []tgCall
-	conns    map[string]BusinessConnection
-	sendErrs []error
+	mu          sync.Mutex
+	calls       []tgCall
+	conns       map[string]BusinessConnection
+	sendErrs    []error
+	files       map[string][]byte // file_id -> content for DownloadFile
+	downloads   []string
+	downloadErr error
+}
+
+// fakePNG is enough for http.DetectContentType to say image/png.
+var fakePNG = append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 32)...)
+
+func (f *fakeTG) DownloadFile(ctx context.Context, fileID string, max int64) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downloads = append(f.downloads, fileID)
+	if f.downloadErr != nil {
+		return nil, f.downloadErr
+	}
+	if data, ok := f.files[fileID]; ok {
+		if int64(len(data)) > max {
+			return nil, &NetError{Method: "file", Kind: "too_large"}
+		}
+		return data, nil
+	}
+	return fakePNG, nil
+}
+
+func (f *fakeTG) downloaded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.downloads...)
 }
 
 func (f *fakeTG) Call(ctx context.Context, method string, params any, out any) error {
@@ -441,9 +469,7 @@ func TestGroupNeedsMentionOrReply(t *testing.T) {
 	}
 	if got := h.b.handleUpdate(Update{UpdateID: 3, Message: &Message{
 		Chat: Chat{ID: -5, Type: "group"}, From: &User{ID: 6}, Text: "and you?",
-		ReplyToMessage: &struct {
-			From *User `json:"from"`
-		}{From: &User{ID: 999}}}}); got != "queued" {
+		ReplyToMessage: &Message{From: &User{ID: 999}}}}); got != "queued" {
 		t.Fatalf("reply-to-bot got %q", got)
 	}
 	waitSent(t, h, 2)

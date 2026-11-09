@@ -44,9 +44,10 @@ type chatState struct {
 	introduced bool
 	updated    int64
 	runes      int
-	userGen    int // bumped on every remembered user message
-	repliedGen int // highest userGen already covered by a sent reply
-	ownerGen   int // highest userGen the owner answered personally
+	images     []string // image file IDs waiting for the next reply (newest kept)
+	userGen    int      // bumped on every remembered user message
+	repliedGen int      // highest userGen already covered by a sent reply
+	ownerGen   int      // highest userGen the owner answered personally
 	chatID     int64
 	conn       string
 	lastUserAt int64 // unix time of the latest customer message
@@ -105,9 +106,9 @@ type Bridge struct {
 	// rulesFileMu serialises every write of the rules files (owner edits,
 	// distillation, reset, undo, reload) so they cannot clobber each other.
 	rulesFileMu     sync.Mutex
-	ownerEditActive bool      // an owner-chat job is running (guarded by mu)
-	ownerEditQueue  []string  // owner messages waiting for that job (guarded by mu)
-	ownerChat       []ChatMsg // short rolling context of the owner chat (guarded by mu)
+	ownerEditActive bool       // an owner-chat job is running (guarded by mu)
+	ownerEditQueue  []ownerMsg // owner messages waiting for that job (guarded by mu)
+	ownerChat       []ChatMsg  // short rolling context of the owner chat (guarded by mu)
 
 	// chat transcripts for /tomtat (transcript.go), guarded by mu
 	trPending   map[string]trPending // queued for the next flush (DB mode)
@@ -341,14 +342,16 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 			cmd, args := parseCommand(text)
 			return b.ownerCommand(m.Chat.ID, conn, key, cmd, args)
 		}
+		content := b.promptText(m)
 		b.mu.Lock()
 		b.mutedUntil[key] = b.now().Add(time.Duration(b.cfg.OwnerMuteMinutes) * time.Minute)
 		cs := b.touchLocked(key)
 		cs.ownerGen = cs.userGen // the owner has answered everything so far
+		cs.images = nil
 		cs.chatID, cs.conn = m.Chat.ID, conn
-		b.recordTranscriptLocked(key, "o", "", text)
-		if text != "" {
-			b.rememberLocked(key, "assistant", text)
+		b.recordTranscriptLocked(key, "o", "", content)
+		if content != "" {
+			b.rememberLocked(key, "assistant", content)
 		} else {
 			b.markChatPendingLocked(key, cs)
 		}
@@ -361,10 +364,13 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 	if !b.businessConnAllowed(conn) {
 		return "conn_rejected"
 	}
-	b.mu.Lock()
-	b.recordTranscriptLocked(key, "c", displayName(m.From), text)
-	b.mu.Unlock()
-	return b.maybeReply(key, m.Chat.ID, text, m.From, conn, m.Date)
+	content := b.promptText(m)
+	if !b.isStale(m.Date) { // replayed backlog would get wrong timestamps
+		b.mu.Lock()
+		b.recordTranscriptLocked(key, "c", displayName(m.From), content)
+		b.mu.Unlock()
+	}
+	return b.maybeReply(key, m.Chat.ID, content, m.From, conn, m.Date, b.messageImages(m)...)
 }
 
 // onBusinessEdit treats an owner edit as presence; customer edits are ignored.
@@ -392,13 +398,15 @@ func (b *Bridge) onBotMessage(m *Message) string {
 			cmd, args := parseCommand(text)
 			return b.ownerCommand(m.Chat.ID, "", "d:"+strconv.FormatInt(m.Chat.ID, 10), cmd, args)
 		}
-		// The owner's private chat with the bot is a control panel: plain
-		// messages edit the rules instead of being answered like a customer.
-		if strings.TrimSpace(text) == "" {
-			b.sendMsg(m.Chat.ID, "Mình chỉ đọc được tin chữ. Gửi /rules để xem quy tắc, hoặc nhắn để trò chuyện / sửa quy tắc.", "")
+		// The owner's private chat is their assistant: chat, images, and rule
+		// edits; it is never answered like a customer chat.
+		request := b.promptText(m)
+		images := b.messageImages(m)
+		if strings.TrimSpace(request) == "" && len(images) == 0 {
+			b.sendMsg(m.Chat.ID, "Mình đọc được chữ và ảnh. Gửi /rules để xem quy tắc, hoặc nhắn để trò chuyện / sửa quy tắc.", "")
 			return "owner_cmd"
 		}
-		b.startOwnerEdit(m.Chat.ID, "", text)
+		b.startOwnerEdit(m.Chat.ID, "", request, images...)
 		return "owner_edit"
 	}
 	switch ctype {
@@ -410,16 +418,17 @@ func (b *Bridge) onBotMessage(m *Message) string {
 	default:
 		return ""
 	}
-	if text != "" && normCmd(text) == "/start" {
-		text = "Xin chào"
-	}
 	key := "d:" + strconv.FormatInt(m.Chat.ID, 10)
-	if ctype == "private" {
+	content := b.promptText(m)
+	if text != "" && normCmd(text) == "/start" {
+		content = "Xin chào"
+	}
+	if ctype == "private" && !b.isStale(m.Date) {
 		b.mu.Lock()
-		b.recordTranscriptLocked(key, "c", displayName(m.From), text)
+		b.recordTranscriptLocked(key, "c", displayName(m.From), content)
 		b.mu.Unlock()
 	}
-	return b.maybeReply(key, m.Chat.ID, text, m.From, "", m.Date)
+	return b.maybeReply(key, m.Chat.ID, content, m.From, "", m.Date, b.messageImages(m)...)
 }
 
 func (b *Bridge) addressed(m *Message, text string) bool {
@@ -568,11 +577,10 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 	return "owner_cmd"
 }
 
-func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64) string {
+func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64, images ...string) string {
 	// A stale message (Telegram may keep un-acked updates up to 24h) must not
 	// resurrect the bot after a restart; the offset still advances in Run.
-	if b.cfg.MaxBacklogMin > 0 && date > 0 &&
-		b.now().Sub(time.Unix(date, 0)) > time.Duration(b.cfg.MaxBacklogMin)*time.Minute {
+	if b.isStale(date) {
 		return "stale"
 	}
 	var uid int64
@@ -593,12 +601,12 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 	// a later follow-up) but stay silent now.
 	if conn != "" {
 		if b.isMutedLocked(key) {
-			b.noteUserLocked(key, text, chatID, conn, uid)
+			b.noteUserLocked(key, text, chatID, conn, uid, images)
 			b.mu.Unlock()
 			return "muted"
 		}
 		if !b.ownerAwayLocked() {
-			b.noteUserLocked(key, text, chatID, conn, uid)
+			b.noteUserLocked(key, text, chatID, conn, uid, images)
 			b.mu.Unlock()
 			return "owner_online"
 		}
@@ -610,7 +618,7 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 		b.mu.Unlock()
 		return "rate_limited"
 	}
-	cs := b.noteUserLocked(key, text, chatID, conn, uid)
+	cs := b.noteUserLocked(key, text, chatID, conn, uid, images)
 	cs.active++
 	b.mu.Unlock()
 
@@ -624,12 +632,19 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 
 // noteUserLocked remembers a customer message and marks it unanswered.
 // Caller holds b.mu.
-func (b *Bridge) noteUserLocked(key, text string, chatID int64, conn string, uid int64) *chatState {
+func (b *Bridge) noteUserLocked(key, text string, chatID int64, conn string, uid int64, images []string) *chatState {
 	cs := b.touchLocked(key)
 	cs.chatID, cs.conn, cs.lastUID = chatID, conn, uid
+	addImagesLocked(cs, images)
 	cs.lastUserAt = b.now().Unix()
 	cs.userGen++
 	return b.rememberLocked(key, "user", text)
+}
+
+// isStale reports a message older than max_backlog_min (replayed backlog).
+func (b *Bridge) isStale(date int64) bool {
+	return b.cfg.MaxBacklogMin > 0 && date > 0 &&
+		b.now().Sub(time.Unix(date, 0)) > time.Duration(b.cfg.MaxBacklogMin)*time.Minute
 }
 
 func (b *Bridge) isMutedLocked(key string) bool {
@@ -779,6 +794,8 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	msgs := make([]ChatMsg, 0, len(cs.msgs)+1)
 	msgs = append(msgs, ChatMsg{Role: "system", Content: system})
 	msgs = append(msgs, cs.msgs...)
+	imageIDs := cs.images
+	cs.images = nil
 	b.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -786,7 +803,8 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	go b.typingLoop(ctx, chatID, conn)
 
 	t0 := time.Now()
-	reply, err := b.callLLM(ctx, msgs)
+	attachImages(msgs, b.downloadImages(ctx, imageIDs))
+	reply, err := b.callLLMVision(ctx, msgs)
 	cancel()
 	if err != nil {
 		logf("WARN", "llm error: %v", err)
@@ -841,7 +859,7 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	// Persist the delivered reply at once: after a power cut the restored chat
 	// must not look unanswered, or the customer would get the reply twice.
 	if conn != "" {
-		_ = b.flushNow()
+		_ = b.flushState()
 	}
 
 	kind := "direct"
@@ -1059,7 +1077,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 			// Commit the offset right away: a crash in the flush window would
 			// replay fresh messages (duplicate replies) on restart. Meta-only
 			// transactions are tiny; pruning is rate-limited inside flushNow.
-			_ = b.flushNow()
+			_ = b.flushState()
 		}
 	}
 }

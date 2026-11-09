@@ -20,7 +20,8 @@ import (
 // one-level backup for /rules undo.
 
 const ownerEditPrompt = "You are the owner's private assistant inside their Telegram Business auto-reply bot.\n" +
-	"Chat naturally in the owner's language: answer questions, help, small talk. You have no internet access: for live data " +
+	"Chat naturally in the owner's language: answer questions, help, small talk, and analyse images attached to the owner's message " +
+	"(describe, read text, compare prices, give advice). You have no internet access: for live data " +
 	"(prices, news, weather) say you have no real-time data and suggest where to check.\n" +
 	"You can also edit the bot's rule files. OWNER RULES (rules.pinned.md) are the owner's own instructions; " +
 	"AI RULES (rules.md) were learned automatically from chats.\n" +
@@ -490,10 +491,16 @@ const unchangedNote = "ℹ️ Chưa có quy tắc nào được thay đổi. Mu�
 // background so the poll loop never waits on the LLM. Messages are processed
 // one at a time; messages arriving meanwhile are queued and answered together
 // next, each run starting from the then-current rule files.
-func (b *Bridge) startOwnerEdit(chatID int64, conn, request string) {
+// ownerMsg is one queued owner-chat message.
+type ownerMsg struct {
+	text   string
+	images []string // image file IDs
+}
+
+func (b *Bridge) startOwnerEdit(chatID int64, conn, request string, images ...string) {
 	b.mu.Lock()
 	if b.ownerEditActive {
-		b.ownerEditQueue = append(b.ownerEditQueue, request)
+		b.ownerEditQueue = append(b.ownerEditQueue, ownerMsg{request, images})
 		b.mu.Unlock()
 		return
 	}
@@ -503,7 +510,7 @@ func (b *Bridge) startOwnerEdit(chatID int64, conn, request string) {
 	b.jobWG.Add(1)
 	go func() {
 		defer b.jobWG.Done()
-		next := request
+		next := ownerMsg{request, images}
 		for {
 			b.runOwnerEdit(chatID, conn, next)
 			b.mu.Lock()
@@ -512,20 +519,28 @@ func (b *Bridge) startOwnerEdit(chatID int64, conn, request string) {
 				b.mu.Unlock()
 				return
 			}
-			next = strings.Join(b.ownerEditQueue, "\n")
+			var texts, imgs []string
+			for _, q := range b.ownerEditQueue {
+				texts = append(texts, q.text)
+				imgs = append(imgs, q.images...)
+			}
 			b.ownerEditQueue = nil
 			b.mu.Unlock()
+			if len(imgs) > maxImagesPerRequest {
+				imgs = imgs[len(imgs)-maxImagesPerRequest:]
+			}
+			next = ownerMsg{strings.Join(texts, "\n"), imgs}
 		}
 	}()
 }
 
-func (b *Bridge) runOwnerEdit(chatID int64, conn, request string) {
+func (b *Bridge) runOwnerEdit(chatID int64, conn string, msg ownerMsg) {
 	defer func() {
 		if r := recover(); r != nil {
 			logf("ERROR", "owner chat crashed: %v", r)
 		}
 	}()
-	b.ownerEditJob(chatID, conn, request)
+	b.ownerEditJob(chatID, conn, msg.text, msg.images)
 }
 
 // rememberOwnerChat keeps a short rolling context of the owner chat.
@@ -540,7 +555,7 @@ func (b *Bridge) rememberOwnerChat(request, reply string) {
 	}
 }
 
-func (b *Bridge) ownerEditJob(chatID int64, conn, request string) {
+func (b *Bridge) ownerEditJob(chatID int64, conn, request string, imageIDs []string) {
 	b.mu.Lock()
 	owner, ai := b.rulesPinned, b.rulesText
 	history := append([]ChatMsg(nil), b.ownerChat...)
@@ -569,10 +584,12 @@ func (b *Bridge) ownerEditJob(chatID int64, conn, request string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go b.typingLoop(ctx, chatID, conn)
-	out, err := b.callLLM(ctx, []ChatMsg{
+	msgs := []ChatMsg{
 		{Role: "system", Content: ownerEditPrompt},
 		{Role: "user", Content: sb.String()},
-	})
+	}
+	attachImages(msgs, b.downloadImages(ctx, imageIDs))
+	out, err := b.callLLMVision(ctx, msgs)
 	cancel()
 	if err != nil || strings.TrimSpace(out) == "" {
 		logf("WARN", "owner chat: llm error: %v", err)
