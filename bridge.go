@@ -281,7 +281,7 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 	if !b.businessConnAllowed(conn) {
 		return "conn_rejected"
 	}
-	return b.maybeReply(key, m.Chat.ID, text, m.From, conn)
+	return b.maybeReply(key, m.Chat.ID, text, m.From, conn, m.Date)
 }
 
 func (b *Bridge) onBotMessage(m *Message) string {
@@ -306,7 +306,7 @@ func (b *Bridge) onBotMessage(m *Message) string {
 		text = "Xin chào"
 	}
 	key := "d:" + strconv.FormatInt(m.Chat.ID, 10)
-	return b.maybeReply(key, m.Chat.ID, text, m.From, "")
+	return b.maybeReply(key, m.Chat.ID, text, m.From, "", m.Date)
 }
 
 func (b *Bridge) addressed(m *Message, text string) bool {
@@ -374,7 +374,13 @@ func (b *Bridge) ownerCommand(chatID int64, cmd string) string {
 	return "owner_cmd"
 }
 
-func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string) string {
+func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64) string {
+	// A stale message (Telegram may keep un-acked updates up to 24h) must not
+	// resurrect the bot after a restart; the offset still advances in Run.
+	if b.cfg.MaxBacklogMin > 0 && date > 0 &&
+		b.now().Sub(time.Unix(date, 0)) > time.Duration(b.cfg.MaxBacklogMin)*time.Minute {
+		return "stale"
+	}
 	var uid int64
 	if from != nil {
 		uid = from.ID

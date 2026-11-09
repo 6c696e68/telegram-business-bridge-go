@@ -860,3 +860,36 @@ func TestMessageDateUnmarshalled(t *testing.T) {
 		t.Fatalf("date = %d", m.Date)
 	}
 }
+
+func TestBacklogMessagesAreSkipped(t *testing.T) {
+	h := newHarness(nil)
+	old := biz(testConn, 800, 800, "hello")
+	old.BusinessMessage.Date = h.clock.Now().Add(-2 * time.Hour).Unix()
+	if got := h.b.handleUpdate(old); got != "stale" {
+		t.Fatalf("got %q", got)
+	}
+	if h.llm.calls() != 0 {
+		t.Fatal("LLM must not be called for stale messages")
+	}
+	h.b.mu.Lock()
+	quota := h.b.dayCount
+	h.b.mu.Unlock()
+	if quota != 0 {
+		t.Fatal("stale messages must not consume quota")
+	}
+	fresh := biz(testConn, 801, 801, "hi")
+	fresh.BusinessMessage.Date = h.clock.Now().Unix()
+	if got := h.b.handleUpdate(fresh); got != "queued" {
+		t.Fatalf("got %q", got)
+	}
+	waitSent(t, h, 1)
+}
+
+func TestBacklogDisabledAllowsOldMessages(t *testing.T) {
+	h := newHarness(func(c *Config) { c.MaxBacklogMin = 0 })
+	old := biz(testConn, 802, 802, "hello")
+	old.BusinessMessage.Date = h.clock.Now().Add(-24 * time.Hour).Unix()
+	if got := h.b.handleUpdate(old); got != "queued" {
+		t.Fatalf("got %q", got)
+	}
+}
