@@ -9,37 +9,39 @@ import (
 
 // Config mirrors the Python bridge's config.json so the same file works for both.
 type Config struct {
-	BotToken         string `json:"bot_token"`
-	TelegramBase     string `json:"telegram_base"` // override only for tests
-	APIBase          string `json:"api_base"`
-	APIKey           string `json:"api_key"`
-	Model            string `json:"model"`
-	OwnerID          int64  `json:"owner_id"`
-	OwnerUsername    string `json:"owner_username"`
-	OwnerMuteMinutes int    `json:"owner_mute_minutes"`
-	HistoryMessages  int    `json:"history_messages"`
-	PerUserPerHour   int    `json:"per_user_per_hour"`
-	DailyReplyCap    int    `json:"daily_reply_cap"`
-	LLMTimeoutSec    int    `json:"llm_timeout"`
-	MaxInputChars    int    `json:"max_input_chars"`
-	MaxReplyChars    int    `json:"max_reply_chars"`
-	SystemPromptFile string `json:"system_prompt_file"`
-	StateFile        string `json:"state_file"`
-	MaxConcurrentLLM int    `json:"max_concurrent_llm"`
-	MaxChats         int    `json:"max_chats"`
-	LLMRetries       int    `json:"llm_retries"`
-	DBFile           string `json:"db_file"`
-	FlushSec         int    `json:"flush_sec"`
-	MemoryDays       int    `json:"memory_days"`
-	MaxStoredChats   int    `json:"max_stored_chats"`
-	MaxBacklogMin    int    `json:"max_backlog_min"`
-	HistoryMaxChars  int    `json:"history_max_chars"`
-	RulesEnabled     bool   `json:"rules_enabled"`
-	RulesFile        string `json:"rules_file"`
-	RulesMaxChars    int    `json:"rules_max_chars"`
-	RulesUpdateEvery int    `json:"rules_update_every"`
-	RulesAllowURL    bool   `json:"rules_allow_url"`
-	DBCompactMB      int    `json:"db_compact_mb"`
+	BotToken         string   `json:"bot_token"`
+	TelegramBase     string   `json:"telegram_base"` // override only for tests
+	APIBase          string   `json:"api_base"`
+	APIKey           string   `json:"api_key"`
+	Model            string   `json:"model"`
+	OwnerID          int64    `json:"owner_id"`
+	OwnerUsername    string   `json:"owner_username"`
+	OwnerMuteMinutes int      `json:"owner_mute_minutes"`
+	HistoryMessages  int      `json:"history_messages"`
+	PerUserPerHour   int      `json:"per_user_per_hour"`
+	DailyReplyCap    int      `json:"daily_reply_cap"`
+	LLMTimeoutSec    int      `json:"llm_timeout"`
+	MaxInputChars    int      `json:"max_input_chars"`
+	MaxReplyChars    int      `json:"max_reply_chars"`
+	SystemPromptFile string   `json:"system_prompt_file"`
+	StateFile        string   `json:"state_file"`
+	MaxConcurrentLLM int      `json:"max_concurrent_llm"`
+	MaxChats         int      `json:"max_chats"`
+	LLMRetries       int      `json:"llm_retries"`
+	FallbackModels   []string `json:"fallback_models"`
+	ShutdownDrainSec int      `json:"shutdown_drain_sec"`
+	DBFile           string   `json:"db_file"`
+	FlushSec         int      `json:"flush_sec"`
+	MemoryDays       int      `json:"memory_days"`
+	MaxStoredChats   int      `json:"max_stored_chats"`
+	MaxBacklogMin    int      `json:"max_backlog_min"`
+	HistoryMaxChars  int      `json:"history_max_chars"`
+	RulesEnabled     bool     `json:"rules_enabled"`
+	RulesFile        string   `json:"rules_file"`
+	RulesMaxChars    int      `json:"rules_max_chars"`
+	RulesUpdateEvery int      `json:"rules_update_every"`
+	RulesAllowURL    bool     `json:"rules_allow_url"`
+	DBCompactMB      int      `json:"db_compact_mb"`
 }
 
 func defaultConfig() Config {
@@ -56,6 +58,7 @@ func defaultConfig() Config {
 		MaxConcurrentLLM: 8,
 		MaxChats:         500,
 		LLMRetries:       2,
+		ShutdownDrainSec: 15,
 		FlushSec:         30,
 		MemoryDays:       7,
 		MaxStoredChats:   1000,
@@ -127,5 +130,27 @@ func loadConfig(path string) (Config, error) {
 	if cfg.RulesUpdateEvery < 2 {
 		cfg.RulesUpdateEvery = 2
 	}
+	if cfg.ShutdownDrainSec < 0 {
+		cfg.ShutdownDrainSec = 0
+	}
 	return cfg, nil
+}
+
+// modelChain returns the primary model followed by configured fallbacks,
+// de-duplicated while preserving order.
+func (c Config) modelChain() []string {
+	seen := make(map[string]bool, len(c.FallbackModels)+1)
+	chain := make([]string, 0, len(c.FallbackModels)+1)
+	add := func(m string) {
+		if m == "" || seen[m] {
+			return
+		}
+		seen[m] = true
+		chain = append(chain, m)
+	}
+	add(c.Model)
+	for _, m := range c.FallbackModels {
+		add(m)
+	}
+	return chain
 }

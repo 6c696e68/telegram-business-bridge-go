@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 func newHTTPClient(maxIdle int) *http.Client {
 	tr := &http.Transport{
@@ -54,7 +54,7 @@ func main() {
 
 	hc := newHTTPClient(4)
 	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, hc),
-		NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, hc))
+		NewLLMChain(cfg.APIBase, cfg.APIKey, cfg.modelChain(), hc))
 	if b.dbErr != nil {
 		logf("ERROR", "%s", b.dbErr.Error())
 		os.Exit(2)
@@ -76,6 +76,9 @@ func main() {
 		os.Exit(1)
 	}
 	<-flushDone
+	if !b.Drain(time.Duration(cfg.ShutdownDrainSec) * time.Second) {
+		logf("WARN", "shutdown drain timed out; some replies may be cut")
+	}
 	if err := b.Close(); err != nil {
 		logf("WARN", "final flush failed: %s", err)
 	}

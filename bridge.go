@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,6 +92,7 @@ type Bridge struct {
 	distillActive bool
 
 	lastPrune time.Time
+	jobWG     sync.WaitGroup
 }
 
 func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
@@ -439,11 +441,25 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		if b.paused {
 			status = "TẠM DỪNG"
 		}
+		persist := b.persistent
+		rulesOn := b.rulesOn()
+		rlen := runeCount(b.rulesText)
 		msg = fmt.Sprintf("Trạng thái: %s\nKết nối Business hợp lệ: %d\nĐã trả lời hôm nay: %d/%d\n"+
 			"Chat đang im lặng (bạn đang tự trả lời): %d\nAI đang xử lý: %d/%d | Chat trong bộ nhớ: %d/%d",
 			status, ok, b.dayCount, b.cfg.DailyReplyCap, muted,
 			b.llmActive, b.cfg.MaxConcurrentLLM, b.lru.Len(), b.cfg.MaxChats)
 		b.mu.Unlock()
+		if persist {
+			size, chats := b.storageStats()
+			msg += fmt.Sprintf("\nLưu trữ: %s (%.1f MB, %d chat)", filepath.Base(b.cfg.DBFile), float64(size)/(1<<20), chats)
+		} else {
+			msg += "\nLưu trữ: chỉ RAM"
+		}
+		if rulesOn {
+			msg += fmt.Sprintf("\nRules: bật (%d ký tự)", rlen)
+		} else {
+			msg += "\nRules: tắt"
+		}
 	default:
 		msg = "Lệnh: /pause /resume /status /reload /rules [reset|off|on]"
 	}
@@ -484,7 +500,11 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 	cs.active++
 	b.mu.Unlock()
 
-	go b.replyJob(cs, key, chatID, conn)
+	b.jobWG.Add(1)
+	go func() {
+		defer b.jobWG.Done()
+		b.replyJob(cs, key, chatID, conn)
+	}()
 	return "queued"
 }
 
@@ -650,7 +670,11 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	}
 	b.mu.Unlock()
 	if fire {
-		go b.distillJob()
+		b.jobWG.Add(1)
+		go func() {
+			defer b.jobWG.Done()
+			b.distillJob()
+		}()
 	}
 
 	kind := "direct"
@@ -867,4 +891,23 @@ func minDur(a, c time.Duration) time.Duration {
 		return a
 	}
 	return c
+}
+
+// Drain waits up to limit for in-flight reply/distill jobs to finish. Used on
+// shutdown so a SIGTERM does not cut a reply mid-flight; 0 disables waiting.
+func (b *Bridge) Drain(limit time.Duration) bool {
+	if limit <= 0 {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		b.jobWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(limit):
+		return false
+	}
 }

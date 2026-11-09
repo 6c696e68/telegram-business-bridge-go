@@ -525,3 +525,27 @@ func (b *Bridge) reopenDB() {
 	}
 	b.db = nd
 }
+
+// storageStats reports DB size and stored chat count for /status.
+func (b *Bridge) storageStats() (int64, int) {
+	if !b.persistent {
+		return 0, 0
+	}
+	var size int64
+	if fi, err := os.Stat(b.cfg.DBFile); err == nil {
+		size = fi.Size()
+	}
+	b.flushMu.Lock()
+	db := b.db
+	b.flushMu.Unlock()
+	n := 0
+	if db != nil {
+		_ = db.View(func(tx *bolt.Tx) error {
+			if ck := tx.Bucket(bucketChats); ck != nil {
+				n = ck.Stats().KeyN
+			}
+			return nil
+		})
+	}
+	return size, n
+}

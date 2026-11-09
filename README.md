@@ -24,6 +24,9 @@ It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go run
 - Limits: replies per user per hour, daily cap, bounded concurrent LLM calls, LRU chat memory with a
   per-chat character cap.
 - Retries on LLM 429/5xx/transport errors and on Telegram flood control (`retry_after`).
+- Fallback model chain: when the primary model keeps answering 429/5xx, the next configured
+  model is tried in the same request (`fallback_models`).
+- Graceful shutdown: in-flight replies get up to `shutdown_drain_sec` to finish before exit.
 - Never logs message text, tokens or API keys. Errors are sanitized (the bot token is in the URL, so transport errors carry only a kind).
 - Long-poll loop with backoff, 409 conflict handling, clean shutdown on SIGTERM.
 
@@ -83,6 +86,8 @@ it can be deleted. Only one process may open the database at a time.
 | `rules_max_chars` | 4000 | hard cap for the file and the injected block |
 | `rules_update_every` | 10 | synthesise after every N successful replies |
 | `rules_allow_url` | false | allow URLs in rules (blocked by default) |
+| `fallback_models` | `[]` | model names tried after the primary on 429/5xx |
+| `shutdown_drain_sec` | 15 | seconds to wait for in-flight replies on SIGTERM (0 = off) |
 
 The LLM rewrites the whole file (`UNCHANGED` means "no change"). Phone numbers (including
 spaced ones), emails, URLs, foreign Telegram handles, money amounts, IDs, secrets and
