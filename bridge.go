@@ -84,6 +84,8 @@ type Bridge struct {
 	// rules (rules.go); keep here so storage meta can persist the switch.
 	rulesEnabled bool
 	rulesRunOn   bool
+	rulesText    string
+	rulesPending int
 }
 
 func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
