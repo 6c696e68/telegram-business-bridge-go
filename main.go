@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.4.0"
+const version = "1.5.0"
 
 func newHTTPClient(maxIdle int) *http.Client {
 	tr := &http.Transport{
@@ -66,6 +66,11 @@ func main() {
 	defer stop()
 
 	go b.statsLoop(ctx)
+	presenceDone := make(chan struct{})
+	go func() {
+		b.presenceLoop(ctx)
+		close(presenceDone)
+	}()
 	go b.startHealth(ctx, cfg.HealthAddr)
 
 	flushDone := make(chan struct{})
@@ -74,13 +79,17 @@ func main() {
 		close(flushDone)
 	}()
 
-	if err := b.Run(ctx); err != nil {
-		logf("ERROR", "fatal: %v", err)
-		<-flushDone
+	runErr := b.Run(ctx)
+	// Always cancel before joining the workers: on a fatal Run error the
+	// signal context is still live and waiting on it would hang forever.
+	stop()
+	<-flushDone
+	<-presenceDone // no follow-up job may start once draining begins
+	if runErr != nil {
+		logf("ERROR", "fatal: %v", runErr)
 		_ = b.Close()
 		os.Exit(1)
 	}
-	<-flushDone
 	if !b.Drain(time.Duration(cfg.ShutdownDrainSec) * time.Second) {
 		logf("WARN", "shutdown drain timed out; some replies may be cut")
 	}

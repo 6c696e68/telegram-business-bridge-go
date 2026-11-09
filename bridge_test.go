@@ -353,10 +353,14 @@ func TestOwnerTypingMutesChat(t *testing.T) {
 	if got := h.b.handleUpdate(biz(testConn, 111, 111, "ok anh")); got != "muted" {
 		t.Fatalf("got %q", got)
 	}
-	if got := h.b.handleUpdate(biz(testConn, 333, 333, "hi")); got != "queued" {
+	// The owner being active anywhere silences every business chat.
+	if got := h.b.handleUpdate(biz(testConn, 333, 333, "hi")); got != "owner_online" {
 		t.Fatalf("other chat got %q", got)
 	}
-	waitSent(t, h, 1)
+	settle()
+	if n := len(h.tg.sends()); n != 0 {
+		t.Fatalf("no business reply may be sent while the owner is online, got %d", n)
+	}
 }
 
 func TestMuteExpires(t *testing.T) {
@@ -1074,7 +1078,10 @@ func TestOwnerCommandInsideBusinessChat(t *testing.T) {
 
 func TestForgetClearsChat(t *testing.T) {
 	dir := t.TempDir()
-	h := newHarness(func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	h := newHarness(func(c *Config) {
+		c.DBFile = filepath.Join(dir, "bridge.db")
+		c.OwnerAwayMinutes = 0 // presence is covered by presence_test.go
+	})
 	defer func() { _ = h.b.Close() }()
 	h.b.handleUpdate(biz(testConn, 901, 901, "hi"))
 	waitSent(t, h, 1)

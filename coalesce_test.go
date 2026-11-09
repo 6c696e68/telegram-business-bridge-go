@@ -178,13 +178,24 @@ func TestTakeoverDuringDebounceSuppressesReply(t *testing.T) {
 	if got := h.b.handleUpdate(biz(testConn, 640, 640, "còn đó không?")); got != "muted" {
 		t.Fatalf("got %q", got)
 	}
-	// Resume clears mutes; the next message gets exactly one reply.
+	// /resume hands over: the question left waiting during the takeover gets
+	// exactly one follow-up reply, then new messages are answered normally.
 	h.b.handleUpdate(dm(testOwner, testOwner, "/resume"))
-	settle()
+	waitSent(t, h, 2) // the /resume confirmation + the follow-up
+	time.Sleep(150 * time.Millisecond)
+	followups := 0
+	for _, snd := range h.tg.sends() {
+		if snd["business_connection_id"] == testConn {
+			followups++
+		}
+	}
+	if followups != 1 {
+		t.Fatalf("expected exactly one follow-up after resume, got %d", followups)
+	}
 	h.b.handleUpdate(biz(testConn, 640, 640, "alo"))
-	waitSent(t, h, 1)
-	settle()
-	if n := len(h.tg.sends()); n != 1 {
-		t.Fatalf("expected exactly one reply after resume, got %d", n)
+	waitSent(t, h, 3)
+	time.Sleep(150 * time.Millisecond)
+	if n := len(h.tg.sends()); n != 3 {
+		t.Fatalf("expected one more reply for the new message, got %d sends", n)
 	}
 }

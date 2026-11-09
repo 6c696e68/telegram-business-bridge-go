@@ -46,6 +46,11 @@ type chatState struct {
 	runes      int
 	userGen    int // bumped on every remembered user message
 	repliedGen int // highest userGen already covered by a sent reply
+	ownerGen   int // highest userGen the owner answered personally
+	chatID     int64
+	conn       string
+	lastUserAt int64 // unix time of the latest customer message
+	lastUID    int64
 	active     int // reply jobs holding this chat; active chats are never evicted
 	lk         sync.Mutex
 	el         *list.Element
@@ -97,6 +102,7 @@ type Bridge struct {
 
 	lastPrune time.Time
 	startedAt time.Time
+	ownerSeen time.Time // last observed owner activity (presence)
 	jobWG     sync.WaitGroup
 }
 
@@ -127,8 +133,15 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		if b.dbErr != nil {
 			return b
 		}
-		b.loadMetaDB()
+		seenStored := b.loadMetaDB()
 		b.persistent = b.db != nil
+		// First boot of a presence-aware build: we do not know whether the
+		// owner is online, so stay silent for one away period instead of
+		// replying immediately.
+		if !seenStored && cfg.OwnerAwayMinutes > 0 {
+			b.ownerSeen = b.now()
+			b.dirtyMeta = true
+		}
 	} else {
 		b.loadLegacyState()
 	}
@@ -270,6 +283,8 @@ func (b *Bridge) handleUpdate(u Update) string {
 		return ""
 	case u.BusinessMessage != nil:
 		return b.onBusinessMessage(u.BusinessMessage)
+	case u.EditedBusinessMsg != nil:
+		return b.onBusinessEdit(u.EditedBusinessMsg)
 	case u.Message != nil:
 		return b.onBotMessage(u.Message)
 	}
@@ -281,20 +296,34 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 	if conn == "" || m.Chat.Type != "private" {
 		return ""
 	}
+	// Messages sent by a bot on the owner's behalf (including this bridge's own
+	// replies) are not owner activity.
+	if m.SenderBusinessBot != nil {
+		return ""
+	}
 	key := "b:" + conn + ":" + strconv.FormatInt(m.Chat.ID, 10)
 	text := m.body()
 
-	// The owner typing in this chat means a human takeover: go silent here.
+	// The owner typing anywhere means they are online: every business chat goes
+	// silent for owner_away_minutes, and this chat for owner_mute_minutes.
 	// Owner commands are still honoured and replied through the connection.
 	if m.From != nil && m.From.ID == b.cfg.OwnerID {
+		b.mu.Lock()
+		b.markOwnerActiveLocked()
+		b.mu.Unlock()
 		if text != "" && strings.HasPrefix(text, "/") {
 			cmd, args := parseCommand(text)
 			return b.ownerCommand(m.Chat.ID, conn, key, cmd, args)
 		}
 		b.mu.Lock()
 		b.mutedUntil[key] = b.now().Add(time.Duration(b.cfg.OwnerMuteMinutes) * time.Minute)
+		cs := b.touchLocked(key)
+		cs.ownerGen = cs.userGen // the owner has answered everything so far
+		cs.chatID, cs.conn = m.Chat.ID, conn
 		if text != "" {
 			b.rememberLocked(key, "assistant", text)
+		} else {
+			b.markChatPendingLocked(key, cs)
 		}
 		b.mu.Unlock()
 		return "owner_takeover"
@@ -306,6 +335,20 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 		return "conn_rejected"
 	}
 	return b.maybeReply(key, m.Chat.ID, text, m.From, conn, m.Date)
+}
+
+// onBusinessEdit treats an owner edit as presence; customer edits are ignored.
+func (b *Bridge) onBusinessEdit(m *Message) string {
+	if m.BusinessConnectionID == "" || m.SenderBusinessBot != nil {
+		return ""
+	}
+	if m.From != nil && m.From.ID == b.cfg.OwnerID {
+		b.mu.Lock()
+		b.markOwnerActiveLocked()
+		b.mu.Unlock()
+		return "owner_active"
+	}
+	return ""
 }
 
 func (b *Bridge) onBotMessage(m *Message) string {
@@ -351,13 +394,25 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		b.saveStateLocked()
 		b.mu.Unlock()
 		msg = "⏸ Đã tạm dừng tự trả lời."
-	case "/resume":
+	case "/resume", "/away":
+		// The owner hands over now: clear pause, per-chat mutes and presence,
+		// then answer customers who were left waiting.
 		b.mu.Lock()
 		b.paused = false
 		b.mutedUntil = map[string]time.Time{}
+		b.ownerSeen = time.Time{}
 		b.saveStateLocked()
 		b.mu.Unlock()
-		msg = "▶️ Đã bật lại tự trả lời."
+		started := b.sweepPending()
+		msg = "▶️ Bot đang trực thay bạn."
+		if started > 0 {
+			msg += fmt.Sprintf(" Đang trả lời %d chat đang chờ.", started)
+		}
+	case "/here":
+		b.mu.Lock()
+		b.markOwnerActiveLocked()
+		b.mu.Unlock()
+		msg = fmt.Sprintf("🟢 Đã ghi nhận bạn online — bot im lặng %d phút (gửi /away để bot trực ngay).", b.cfg.OwnerAwayMinutes)
 	case "/reload":
 		p, err := b.readPrompt()
 		if err != nil {
@@ -470,10 +525,10 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		persist := b.persistent
 		rulesOn := b.rulesOn()
 		rlen := runeCount(b.rulesText)
-		msg = fmt.Sprintf("Trạng thái: %s\nKết nối Business hợp lệ: %d\nTin xử lý hôm nay: %d/%d | Đã trả lời: %d\n"+
-			"Chat đang im lặng (bạn đang tự trả lời): %d\nAI đang xử lý: %d/%d | Chat trong bộ nhớ: %d/%d",
-			status, ok, b.dayCount, b.cfg.DailyReplyCap, b.repliesSent, muted,
-			b.llmActive, b.cfg.MaxConcurrentLLM, b.lru.Len(), b.cfg.MaxChats)
+		msg = fmt.Sprintf("Trạng thái: %s\n%s\nKết nối Business hợp lệ: %d\nTin xử lý hôm nay: %d/%d | Đã trả lời: %d\n"+
+			"Chat đang im lặng (bạn đang tự trả lời): %d | Chat chờ trả lời: %d\nAI đang xử lý: %d/%d | Chat trong bộ nhớ: %d/%d",
+			status, b.presenceLineLocked(), ok, b.dayCount, b.cfg.DailyReplyCap, b.repliesSent, muted,
+			b.pendingCountLocked(), b.llmActive, b.cfg.MaxConcurrentLLM, b.lru.Len(), b.cfg.MaxChats)
 		b.mu.Unlock()
 		if persist {
 			size, chats := b.storageStats()
@@ -487,7 +542,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			msg += "\nRules: tắt"
 		}
 	default:
-		msg = "Lệnh: /pause /resume /status /stats /reload /rules [reset|off|on] /forget"
+		msg = "Lệnh: /here /away /pause /resume /status /stats /reload /rules [reset|off|on] /forget"
 	}
 	b.sendMsg(chatID, msg, conn)
 	return "owner_cmd"
@@ -514,7 +569,20 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 		b.mu.Unlock()
 		return "paused"
 	}
-	if b.isMutedLocked(key) {
+	// Business chats while the owner is around: keep the message (context and
+	// a later follow-up) but stay silent now.
+	if conn != "" {
+		if b.isMutedLocked(key) {
+			b.noteUserLocked(key, text, chatID, conn, uid)
+			b.mu.Unlock()
+			return "muted"
+		}
+		if !b.ownerAwayLocked() {
+			b.noteUserLocked(key, text, chatID, conn, uid)
+			b.mu.Unlock()
+			return "owner_online"
+		}
+	} else if b.isMutedLocked(key) {
 		b.mu.Unlock()
 		return "muted"
 	}
@@ -522,8 +590,7 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 		b.mu.Unlock()
 		return "rate_limited"
 	}
-	cs := b.rememberLocked(key, "user", text)
-	cs.userGen++
+	cs := b.noteUserLocked(key, text, chatID, conn, uid)
 	cs.active++
 	b.mu.Unlock()
 
@@ -535,9 +602,28 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 	return "queued"
 }
 
+// noteUserLocked remembers a customer message and marks it unanswered.
+// Caller holds b.mu.
+func (b *Bridge) noteUserLocked(key, text string, chatID int64, conn string, uid int64) *chatState {
+	cs := b.touchLocked(key)
+	cs.chatID, cs.conn, cs.lastUID = chatID, conn, uid
+	cs.lastUserAt = b.now().Unix()
+	cs.userGen++
+	return b.rememberLocked(key, "user", text)
+}
+
 func (b *Bridge) isMutedLocked(key string) bool {
 	t, ok := b.mutedUntil[key]
 	return ok && t.After(b.now())
+}
+
+// silencedLocked reports whether a reply must not be sent right now.
+// Caller holds b.mu.
+func (b *Bridge) silencedLocked(key, conn string) bool {
+	if b.paused || b.isMutedLocked(key) {
+		return true
+	}
+	return conn != "" && !b.ownerAwayLocked()
 }
 
 // ---------- chat memory (LRU) ----------
@@ -649,12 +735,12 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	}
 
 	b.mu.Lock()
-	if b.paused || b.isMutedLocked(key) {
+	if b.silencedLocked(key, conn) {
 		b.mu.Unlock()
 		return
 	}
-	// Another job already answered everything we would answer.
-	if cs.userGen <= cs.repliedGen {
+	// Everything was already answered by another job or by the owner.
+	if !cs.pendingLocked() {
 		b.mu.Unlock()
 		return
 	}
@@ -684,9 +770,9 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 		return
 	}
 
-	// The owner may have taken over while the model was thinking.
+	// The owner may have come online or answered while the model was thinking.
 	b.mu.Lock()
-	if b.paused || b.isMutedLocked(key) {
+	if b.silencedLocked(key, conn) || cs.ownerGen >= gen {
 		b.mu.Unlock()
 		return
 	}
@@ -833,8 +919,27 @@ func (b *Bridge) Run(ctx context.Context) error {
 		ID       int64  `json:"id"`
 		Username string `json:"username"`
 	}
-	if err := b.tg.Call(ctx, "getMe", nil, &me); err != nil {
-		return fmt.Errorf("getMe: %w", err)
+	// A router often boots before its uplink is ready: keep retrying transient
+	// failures instead of exiting, but fail fast on a rejected token.
+	wait := 2 * time.Second
+	for {
+		err := b.tg.Call(ctx, "getMe", nil, &me)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		var te *TGError
+		if errors.As(err, &te) && te.RetryAfter == 0 && te.Code >= 400 && te.Code < 500 && te.Code != 429 {
+			return fmt.Errorf("getMe: %w", err)
+		}
+		logf("WARN", "getMe failed, retrying in %s: %v", wait, err)
+		b.sleep(ctx, wait)
+		if ctx.Err() != nil {
+			return nil
+		}
+		wait = minDur(wait*2, time.Minute)
 	}
 	b.botID, b.botUsername = me.ID, me.Username
 	b.mu.Lock()
@@ -853,7 +958,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 		hasOffset = true
 	}
 	b.mu.Unlock()
-	allowed := []string{"message", "business_connection", "business_message"}
+	allowed := []string{"message", "business_connection", "business_message", "edited_business_message"}
 	backoff := time.Second
 	pollParams := map[string]any{"timeout": 50, "allowed_updates": allowed}
 

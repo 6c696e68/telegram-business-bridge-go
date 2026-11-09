@@ -440,6 +440,7 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 	cfg.APIBase = llmSrv.URL
 	cfg.APIKey = "k"
 	cfg.DBFile = filepath.Join(dir, "bridge.db")
+	cfg.OwnerAwayMinutes = 0 // a fresh DB would otherwise start in "owner online"
 
 	offsetSeen := func(min float64) bool {
 		tgSrv.mu.Lock()

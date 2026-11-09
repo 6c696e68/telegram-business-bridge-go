@@ -26,6 +26,11 @@ type chatRecord struct {
 	Introduced bool      `json:"introduced"`
 	Updated    int64     `json:"updated"`
 	Msgs       []ChatMsg `json:"msgs"`
+	ChatID     int64     `json:"chat_id,omitempty"`
+	Conn       string    `json:"conn,omitempty"`
+	LastUser   int64     `json:"last_user,omitempty"`
+	LastUID    int64     `json:"last_uid,omitempty"`
+	Pending    bool      `json:"pending,omitempty"`
 }
 
 // recordMeta decodes only the timestamp; used by prune/restore scans so bulk
@@ -42,6 +47,7 @@ type metaSnapshot struct {
 	ConnOK      map[string]bool
 	RulesOn     bool
 	RepliesSent int
+	OwnerSeen   int64 // unix seconds; 0 = owner treated as away
 }
 
 func metaSnapshotFromLocked(b *Bridge) metaSnapshot {
@@ -53,6 +59,7 @@ func metaSnapshotFromLocked(b *Bridge) metaSnapshot {
 		Paused: b.paused, Offset: b.offset, Day: b.day,
 		DayCount: b.dayCount, ConnOK: conn, RulesOn: b.rulesRunOn,
 		RepliesSent: b.repliesSent,
+		OwnerSeen:   unixOrZero(b.ownerSeen),
 	}
 }
 
@@ -72,6 +79,7 @@ func writeMetaTx(tx *bolt.Tx, ms metaSnapshot) error {
 	put("day", ms.Day)
 	put("day_count", strconv.Itoa(ms.DayCount))
 	put("replies_sent", strconv.Itoa(ms.RepliesSent))
+	put("owner_seen", strconv.FormatInt(ms.OwnerSeen, 10))
 	if c, e := json.Marshal(ms.ConnOK); e == nil {
 		put("conn_ok", string(c))
 	}
@@ -100,6 +108,11 @@ func (b *Bridge) markChatPendingLocked(key string, cs *chatState) {
 		Introduced: cs.introduced,
 		Updated:    cs.updated,
 		Msgs:       append([]ChatMsg(nil), cs.msgs...),
+		ChatID:     cs.chatID,
+		Conn:       cs.conn,
+		LastUser:   cs.lastUserAt,
+		LastUID:    cs.lastUID,
+		Pending:    cs.pendingLocked(),
 	}
 }
 
@@ -151,7 +164,9 @@ func (b *Bridge) openDB(path string) {
 	}
 }
 
-func (b *Bridge) loadMetaDB() {
+// loadMetaDB restores persisted meta. It reports whether owner presence was
+// stored, so a first boot of a presence-aware build can start conservatively.
+func (b *Bridge) loadMetaDB() (ownerSeenStored bool) {
 	_ = b.db.View(func(tx *bolt.Tx) error {
 		mb := tx.Bucket(bucketMeta)
 		if mb == nil || len(mb.Get([]byte("schema"))) == 0 {
@@ -178,8 +193,22 @@ func (b *Bridge) loadMetaDB() {
 			}
 		}
 		b.rulesRunOn = string(get("rules_on")) != "0"
+		if v := get("owner_seen"); v != nil {
+			ownerSeenStored = true
+			if ts, err := strconv.ParseInt(string(v), 10, 64); err == nil && ts > 0 {
+				b.ownerSeen = time.Unix(ts, 0)
+			}
+		}
 		return nil
 	})
+	return ownerSeenStored
+}
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }
 
 // loadLegacyState reads the old state.json in memory-only mode.
@@ -459,6 +488,13 @@ func (b *Bridge) restoreChats() {
 				introduced: rec.Introduced,
 				updated:    rec.Updated,
 				msgs:       rec.Msgs,
+				chatID:     rec.ChatID,
+				conn:       rec.Conn,
+				lastUserAt: rec.LastUser,
+				lastUID:    rec.LastUID,
+			}
+			if rec.Pending {
+				cs.userGen = 1 // unanswered customer messages survive a restart
 			}
 			if cs.msgs == nil {
 				cs.msgs = []ChatMsg{}

@@ -27,6 +27,7 @@ type Message struct {
 	Chat                 Chat   `json:"chat"`
 	From                 *User  `json:"from"`
 	Date                 int64  `json:"date"`
+	SenderBusinessBot    *User  `json:"sender_business_bot"`
 	Text                 string `json:"text"`
 	Caption              string `json:"caption"`
 	ReplyToMessage       *struct {
@@ -58,6 +59,7 @@ type Update struct {
 	UpdateID           int64               `json:"update_id"`
 	Message            *Message            `json:"message"`
 	BusinessMessage    *Message            `json:"business_message"`
+	EditedBusinessMsg  *Message            `json:"edited_business_message"`
 	BusinessConnection *BusinessConnection `json:"business_connection"`
 }
 

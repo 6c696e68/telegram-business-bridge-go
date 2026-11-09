@@ -31,6 +31,8 @@ type Config struct {
 	FallbackModels   []string `json:"fallback_models"`
 	ShutdownDrainSec int      `json:"shutdown_drain_sec"`
 	DebounceMS       int      `json:"debounce_ms"`
+	OwnerAwayMinutes int      `json:"owner_away_minutes"`
+	FollowupMaxMin   int      `json:"followup_max_min"`
 	MaxTokens        int      `json:"max_tokens"`
 	Temperature      float64  `json:"temperature"`
 	DBFile           string   `json:"db_file"`
@@ -66,6 +68,8 @@ func defaultConfig() Config {
 		LLMRetries:       2,
 		ShutdownDrainSec: 15,
 		DebounceMS:       700,
+		OwnerAwayMinutes: 30,
+		FollowupMaxMin:   120,
 		MaxTokens:        1200,
 		StatsLogMin:      60,
 		FlushSec:         30,
@@ -150,6 +154,12 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.DebounceMS < 0 {
 		cfg.DebounceMS = 0
+	}
+	if cfg.OwnerAwayMinutes < 0 {
+		cfg.OwnerAwayMinutes = 0
+	}
+	if cfg.FollowupMaxMin < 0 {
+		cfg.FollowupMaxMin = 0
 	}
 	if cfg.MaxTokens <= 0 {
 		cfg.MaxTokens = 1200
