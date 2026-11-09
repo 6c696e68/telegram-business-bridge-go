@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -168,4 +169,104 @@ func loadConfigWithDefaults(t *testing.T, dir string) (Config, error) {
 		t.Fatal(err)
 	}
 	return loadConfig(p)
+}
+
+func TestRulesOffKeepsPinnedRules(t *testing.T) {
+	h, _, _ := opsHarness(t)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) { return "ok", false }
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules off"))
+	settle()
+	h.b.handleUpdate(dm(621, 621, "chào"))
+	waitSent(t, h, 2)
+	h.llm.mu.Lock()
+	defer h.llm.mu.Unlock()
+	foundPinned := false
+	for _, seen := range h.llm.seen {
+		if len(seen) > 0 && strings.Contains(seen[0].Content, "không hứa hẹn thay chủ") {
+			foundPinned = true
+		}
+	}
+	if !foundPinned {
+		t.Fatal("owner-pinned rules must stay active when AI rules are off")
+	}
+}
+
+func TestDistillInputExcludesPinned(t *testing.T) {
+	h, _, _ := opsHarness(t)
+	var mu sync.Mutex
+	var distillInputs []string
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			mu.Lock()
+			distillInputs = append(distillInputs, msgs[1].Content)
+			mu.Unlock()
+			return "- Rule AI mới.", true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(622, 622, "một"))
+	waitSent(t, h, 1)
+	h.b.handleUpdate(dm(622, 622, "hai"))
+	waitSent(t, h, 2)
+	waitFor(t, "distill ran", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(distillInputs) > 0
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	for _, in := range distillInputs {
+		if strings.Contains(in, "không hứa hẹn thay chủ") {
+			t.Fatal("pinned rules leaked into distiller input")
+		}
+	}
+}
+
+func TestRulesViewIsTruncated(t *testing.T) {
+	dir := t.TempDir()
+	ai := filepath.Join(dir, "rules.md")
+	pin := filepath.Join(dir, "rules.pinned.md")
+	if err := os.WriteFile(ai, []byte(strings.Repeat("a", 4000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pin, []byte(strings.Repeat("b", 4000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(func(c *Config) {
+		c.RulesFile = ai
+		c.RulesPinnedFile = pin
+	})
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules"))
+	waitSent(t, h, 1)
+	text, _ := h.tg.sends()[0]["text"].(string)
+	if utf16Len(text) > telegramUnitLimit {
+		t.Fatalf("rules view exceeds Telegram limit: %d", utf16Len(text))
+	}
+}
+
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+func TestLoopbackAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8099": true,
+		"[::1]:8099":     true,
+		":8099":          false,
+		"0.0.0.0:8099":   false,
+		"192.168.1.5:80": false,
+	}
+	for addr, want := range cases {
+		if got := loopbackAddr(addr); got != want {
+			t.Errorf("loopbackAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
 }

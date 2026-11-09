@@ -147,11 +147,13 @@ func (b *Bridge) rulesOn() bool { return b.rulesEnabled && b.rulesRunOn }
 // rulesNoteLocked returns the prompt blocks appended to the system prompt.
 // The owner-pinned block is injected verbatim and is never synthesised away.
 func (b *Bridge) rulesNoteLocked() string {
-	if !b.rulesOn() {
+	if !b.rulesEnabled {
 		return ""
 	}
 	note := ""
-	if b.rulesText != "" {
+	// AI rules can be switched off; the owner-pinned block is a guarantee and
+	// stays active regardless of /rules off.
+	if b.rulesOn() && b.rulesText != "" {
 		note += rulesHeader + truncRunes(b.rulesText, b.cfg.RulesMaxChars)
 	}
 	if b.rulesPinned != "" {

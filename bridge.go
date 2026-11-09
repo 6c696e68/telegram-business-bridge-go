@@ -387,7 +387,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			b.rulesGen++
 			b.saveStateLocked()
 			b.mu.Unlock()
-			msg = "🚫 Đã tắt rules (không tổng hợp, không chèn)."
+			msg = "🚫 Đã tắt rules AI (rules.pinned.md của chủ vẫn áp dụng)."
 		case "on":
 			b.mu.Lock()
 			b.rulesRunOn = true
@@ -411,6 +411,8 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			if ptxt != "" {
 				msg += "\n\nrules.pinned.md (" + strconv.Itoa(runeCount(ptxt)) + " ký tự, AI không sửa):\n" + ptxt
 			}
+			// Two capped files can exceed Telegram's limit; keep the send valid.
+			msg = truncUTF16(msg, telegramUnitLimit)
 		}
 	case "/forget":
 		b.mu.Lock()

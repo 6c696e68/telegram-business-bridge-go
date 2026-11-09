@@ -536,11 +536,12 @@ func (b *Bridge) storageStats() (int64, int) {
 		size = fi.Size()
 	}
 	b.flushMu.Lock()
-	db := b.db
-	b.flushMu.Unlock()
+	defer b.flushMu.Unlock()
 	n := 0
-	if db != nil {
-		_ = db.View(func(tx *bolt.Tx) error {
+	if b.db != nil {
+		// Hold flushMu for the whole read tx: Close takes the same mutex
+		// before closing the file, so a snapshot cannot outlive the open DB.
+		_ = b.db.View(func(tx *bolt.Tx) error {
 			if ck := tx.Bucket(bucketChats); ck != nil {
 				n = ck.Stats().KeyN
 			}
