@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -410,4 +411,78 @@ func procRSS() string {
 		}
 	}
 	return strings.Join(out, " | ")
+}
+
+// TestIntegrationRestartDoesNotReplayBacklog proves that the persisted offset
+// survives a restart: the second process must poll with the stored offset and
+// never answer the update consumed by the first process.
+func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
+	dir := t.TempDir()
+	tgSrv := newFakeTelegram(t, nil)
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Dạ em trả lời"}}]}`)
+	}))
+	defer llmSrv.Close()
+
+	updateJSON := fmt.Sprintf(`{"update_id":1,"business_message":{"business_connection_id":"c1","date":%d,`+
+		`"chat":{"id":300,"type":"private"},"from":{"id":300},"text":"một tin nào đó"}}`, time.Now().Unix())
+	tgSrv.mu.Lock()
+	tgSrv.first = []string{updateJSON}
+	tgSrv.mu.Unlock()
+
+	cfg := defaultConfig()
+	cfg.BotToken = integToken
+	cfg.TelegramBase = tgSrv.URL
+	cfg.OwnerID = 1000000001
+	cfg.OwnerUsername = "example_owner"
+	cfg.APIBase = llmSrv.URL
+	cfg.APIKey = "k"
+	cfg.DBFile = filepath.Join(dir, "bridge.db")
+
+	runOnce := func() {
+		b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, http.DefaultClient),
+			NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, http.DefaultClient))
+		if b.dbErr != nil {
+			t.Fatal(b.dbErr)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { _ = b.Run(ctx); close(done) }()
+		if len(tgSrv.sentSnapshot()) == 0 {
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) && len(tgSrv.sentSnapshot()) == 0 {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		cancel()
+		<-done
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runOnce()
+	if n := len(tgSrv.sentSnapshot()); n != 1 {
+		t.Fatalf("first run must reply once, sends=%d", n)
+	}
+
+	runOnce()
+	time.Sleep(150 * time.Millisecond)
+	if n := len(tgSrv.sentSnapshot()); n != 1 {
+		t.Fatalf("restart replayed backlog: sends=%d", n)
+	}
+
+	// The second run must have polled with the persisted offset (>= 2).
+	tgSrv.mu.Lock()
+	offsets := append([]float64(nil), tgSrv.offsets...)
+	tgSrv.mu.Unlock()
+	seenOffset := false
+	for _, off := range offsets {
+		if off >= 2 {
+			seenOffset = true
+		}
+	}
+	if !seenOffset {
+		t.Fatalf("persisted offset never used: %v", offsets)
+	}
 }
