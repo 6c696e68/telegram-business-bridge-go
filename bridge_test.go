@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1045,5 +1046,72 @@ func TestRulesViewAndReset(t *testing.T) {
 	h.b.mu.Unlock()
 	if rt != "" {
 		t.Fatalf("rulesText must be cleared, got %q", rt)
+	}
+}
+
+func TestOwnerCommandInsideBusinessChat(t *testing.T) {
+	h := newHarness(nil)
+	got := h.b.handleUpdate(biz(testConn, 2000, testOwner, "/status"))
+	if got != "owner_cmd" {
+		t.Fatalf("got %q", got)
+	}
+	sends := h.tg.sends()
+	if len(sends) == 0 || sends[0]["business_connection_id"] != testConn {
+		t.Fatal("reply must go through the business connection")
+	}
+}
+
+func TestForgetClearsChat(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	defer func() { _ = h.b.Close() }()
+	h.b.handleUpdate(biz(testConn, 901, 901, "hi"))
+	waitSent(t, h, 1)
+	settle()
+	key := "b:" + testConn + ":901"
+	h.b.mu.Lock()
+	_, ok := h.b.chats[key]
+	h.b.mu.Unlock()
+	if !ok {
+		t.Fatal("chat must exist before forget")
+	}
+	if got := h.b.handleUpdate(biz(testConn, 901, testOwner, "/forget")); got != "owner_cmd" {
+		t.Fatalf("got %q", got)
+	}
+	h.b.mu.Lock()
+	_, still := h.b.chats[key]
+	_, deleted := h.b.deletedChats[key]
+	h.b.mu.Unlock()
+	if still {
+		t.Fatal("chat not removed from RAM")
+	}
+	if !deleted {
+		t.Fatal("delete not queued for DB")
+	}
+}
+
+func TestOwnerTextStillMutesChat(t *testing.T) {
+	h := newHarness(nil)
+	if got := h.b.handleUpdate(biz(testConn, 902, testOwner, "mình tự trả lời nha")); got != "owner_takeover" {
+		t.Fatalf("got %q", got)
+	}
+	if got := h.b.handleUpdate(biz(testConn, 902, 902, "hello?")); got != "muted" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestForgetInDirectChat(t *testing.T) {
+	h := newHarness(nil)
+	h.b.handleUpdate(dm(777, 777, "hello"))
+	waitSent(t, h, 1)
+	settle()
+	if got := h.b.handleUpdate(dm(testOwner, testOwner, "/forget")); got != "owner_cmd" {
+		t.Fatalf("got %q", got)
+	}
+	h.b.mu.Lock()
+	_, still := h.b.chats["d:"+strconv.FormatInt(testOwner, 10)]
+	h.b.mu.Unlock()
+	if still {
+		t.Fatal("owner DM context not cleared")
 	}
 }

@@ -271,7 +271,12 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 	text := m.body()
 
 	// The owner typing in this chat means a human takeover: go silent here.
+	// Owner commands are still honoured and replied through the connection.
 	if m.From != nil && m.From.ID == b.cfg.OwnerID {
+		if text != "" && strings.HasPrefix(text, "/") {
+			cmd, args := parseCommand(text)
+			return b.ownerCommand(m.Chat.ID, conn, key, cmd, args)
+		}
 		b.mu.Lock()
 		b.mutedUntil[key] = b.now().Add(time.Duration(b.cfg.OwnerMuteMinutes) * time.Minute)
 		if text != "" {
@@ -392,6 +397,20 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 				msg = "rules.md (" + state + ", " + strconv.Itoa(runeCount(rtxt)) + " ký tự):\n" + rtxt
 			}
 		}
+	case "/forget":
+		b.mu.Lock()
+		if cs, ok := b.chats[key]; ok {
+			b.lru.Remove(cs.el)
+			delete(b.chats, key)
+		}
+		delete(b.dirtyChats, key)
+		if b.db != nil {
+			b.deletedChats[key] = struct{}{}
+		}
+		delete(b.mutedUntil, key)
+		b.mu.Unlock()
+		logf("INFO", "owner forgot a chat")
+		msg = "🗑 Đã xoá ngữ cảnh chat này."
 	case "/status":
 		b.mu.Lock()
 		ok := 0
