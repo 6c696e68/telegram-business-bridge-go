@@ -1,6 +1,7 @@
 # built binaries and local test artifacts
 tg-bridge
 tg-bridge-*
+tgbridge
 *.test
 *.out
 testdata/

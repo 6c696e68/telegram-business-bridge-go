@@ -160,3 +160,14 @@ func TestRulesSourceDistillGuardOnShortChat(t *testing.T) {
 		t.Fatal("short sources must not match")
 	}
 }
+
+func TestSanitizeColonlessSecretAndBlob(t *testing.T) {
+	in := "- Dùng token sk abcdefghijklmnop1234567890 nhé.\n- JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdef1234567890.\n- Trả lời ngắn gọn.\n- Hỗ trợ khách trong giờ hành chính.\n"
+	got := sanitizeRules(in, "@owner", false, 1000)
+	if strings.Contains(got, "abcdefghijklmnop") || strings.Contains(got, "eyJhbGci") {
+		t.Fatalf("secret-shaped token leaked: %q", got)
+	}
+	if !strings.Contains(got, "ngắn gọn") {
+		t.Fatalf("benign line dropped: %q", got)
+	}
+}

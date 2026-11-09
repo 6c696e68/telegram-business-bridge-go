@@ -89,6 +89,8 @@ type Bridge struct {
 	rulesPending  int
 	rulesGen      int
 	distillActive bool
+
+	lastPrune time.Time
 }
 
 func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
@@ -637,8 +639,8 @@ func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) 
 	}
 	fire := false
 	b.mu.Lock()
-	b.rememberLocked(key, "assistant", reply)
 	cs.introduced = true
+	b.rememberLocked(key, "assistant", reply)
 	if b.rulesOn() {
 		b.rulesPending++
 		if b.rulesPending >= b.cfg.RulesUpdateEvery {
@@ -842,6 +844,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 			b.offset = offset
 			b.dirtyMeta = true
 			b.mu.Unlock()
+			// Commit the offset right away: a crash in the flush window would
+			// replay fresh messages (duplicate replies) on restart. Meta-only
+			// transactions are tiny; pruning is rate-limited inside flushNow.
+			_ = b.flushNow()
 		}
 	}
 }

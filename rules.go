@@ -17,14 +17,16 @@ var (
 	reMoney  = regexp.MustCompile(`(?i)\d+[,.]?\d*\s*(vnd|đ|usd|\$|k\b|tr\b|triệu|tỷ)`)
 	reHandle = regexp.MustCompile(`@[A-Za-z0-9_]{3,}`)
 	reID     = regexp.MustCompile(`(?i)\bid\b[^0-9]{0,3}\d{3,}`)
-	reSecret = regexp.MustCompile(`(?i)(mật\s*khẩu|password|passwd|api[_ ]?key|secret|token)\s*[:=]\s*\S+`)
+	reSecret = regexp.MustCompile(`(?i)(mật\s*khẩu|password|passwd|api[_ ]?key|secret|token)[^\n]{0,12}?[A-Za-z0-9+/=_\-\.]{8,}`)
+	reBlob   = regexp.MustCompile(`eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}|[A-Za-z0-9+/=_\-]{32,}`)
 )
 
 // lineBad reports a sensitive-data policy violation in one candidate rule line.
 func lineBad(line, ownerTag string, allowURL bool) bool {
 	if reEmail.MatchString(line) || reDigits.MatchString(line) ||
 		reSpaced.MatchString(line) || reMoney.MatchString(line) ||
-		reID.MatchString(line) || reSecret.MatchString(line) {
+		reID.MatchString(line) || reSecret.MatchString(line) ||
+		reBlob.MatchString(line) {
 		return true
 	}
 	if !allowURL && reURL.MatchString(line) {
@@ -248,9 +250,13 @@ func (b *Bridge) distillJob() {
 		return
 	}
 	b.mu.Lock()
-	if b.rulesGen == gen {
-		b.rulesText = clean
+	if b.rulesGen != gen {
+		// reset/off/forget landed while the write was in flight: undo it.
+		b.mu.Unlock()
+		_ = os.Remove(b.cfg.RulesFile)
+		return
 	}
+	b.rulesText = clean
 	b.mu.Unlock()
 	logf("INFO", "rules updated: %d chars", runeCount(clean))
 }

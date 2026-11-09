@@ -266,7 +266,12 @@ func (b *Bridge) flushNow() error {
 				return e
 			}
 		}
-		pruneChatsTx(tx, b.now(), b.cfg)
+		// Pruning scans every record; run it at most hourly so the frequent
+		// offset flushes stay tiny.
+		if b.lastPrune.IsZero() || b.now().Sub(b.lastPrune) >= time.Hour {
+			pruneChatsTx(tx, b.now(), b.cfg)
+			b.lastPrune = b.now()
+		}
 		return nil
 	})
 	if err != nil {

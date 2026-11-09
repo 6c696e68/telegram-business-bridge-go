@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -1095,6 +1097,19 @@ func TestForgetClearsChat(t *testing.T) {
 	}
 	if !deleted {
 		t.Fatal("delete not queued for DB")
+	}
+	if err := h.b.flushNow(); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	_ = h.b.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketChats).Get([]byte(key)) != nil {
+			found = true
+		}
+		return nil
+	})
+	if found {
+		t.Fatal("forgotten chat resurrected on disk")
 	}
 }
 

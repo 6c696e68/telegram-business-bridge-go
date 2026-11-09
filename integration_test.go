@@ -439,7 +439,18 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 	cfg.APIKey = "k"
 	cfg.DBFile = filepath.Join(dir, "bridge.db")
 
-	runOnce := func() {
+	offsetSeen := func(min float64) bool {
+		tgSrv.mu.Lock()
+		defer tgSrv.mu.Unlock()
+		for _, off := range tgSrv.offsets {
+			if off >= min {
+				return true
+			}
+		}
+		return false
+	}
+
+	runOnce := func(wait func() bool) {
 		b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, http.DefaultClient),
 			NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, http.DefaultClient))
 		if b.dbErr != nil {
@@ -448,11 +459,9 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { _ = b.Run(ctx); close(done) }()
-		if len(tgSrv.sentSnapshot()) == 0 {
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) && len(tgSrv.sentSnapshot()) == 0 {
-				time.Sleep(10 * time.Millisecond)
-			}
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) && !wait() {
+			time.Sleep(10 * time.Millisecond)
 		}
 		cancel()
 		<-done
@@ -461,28 +470,19 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 		}
 	}
 
-	runOnce()
+	runOnce(func() bool { return len(tgSrv.sentSnapshot()) >= 1 })
 	if n := len(tgSrv.sentSnapshot()); n != 1 {
 		t.Fatalf("first run must reply once, sends=%d", n)
 	}
 
-	runOnce()
+	// The second run must poll with the persisted offset (>= 2) and must not
+	// answer the already-consumed update.
+	runOnce(func() bool { return offsetSeen(2) })
 	time.Sleep(150 * time.Millisecond)
 	if n := len(tgSrv.sentSnapshot()); n != 1 {
 		t.Fatalf("restart replayed backlog: sends=%d", n)
 	}
-
-	// The second run must have polled with the persisted offset (>= 2).
-	tgSrv.mu.Lock()
-	offsets := append([]float64(nil), tgSrv.offsets...)
-	tgSrv.mu.Unlock()
-	seenOffset := false
-	for _, off := range offsets {
-		if off >= 2 {
-			seenOffset = true
-		}
-	}
-	if !seenOffset {
-		t.Fatalf("persisted offset never used: %v", offsets)
+	if !offsetSeen(2) {
+		t.Fatal("persisted offset never used")
 	}
 }

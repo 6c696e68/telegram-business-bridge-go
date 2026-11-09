@@ -135,7 +135,8 @@ func TestMemoryModeWritesNothing(t *testing.T) {
 func TestChatHistoryRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfg := dbTestConfig(dir, func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
-	b1 := NewBridge(cfg, &fakeTG{}, &fakeLLM{reply: "Dạ em trả lời"})
+	tg1 := &fakeTG{}
+	b1 := NewBridge(cfg, tg1, &fakeLLM{reply: "Dạ em trả lời"})
 	clock := &fakeClock{t: time.Date(2026, 11, 9, 12, 0, 0, 0, time.Local)}
 	b1.now = clock.Now
 	b1.sleep = func(ctx context.Context, d time.Duration) {}
@@ -143,7 +144,7 @@ func TestChatHistoryRoundTrip(t *testing.T) {
 	if got := b1.handleUpdate(dm(555, 555, "hello")); got != "queued" {
 		t.Fatalf("got %q", got)
 	}
-	waitFor(t, "reply sent", func() bool { return b1.tg != nil })
+	waitFor(t, "reply sent", func() bool { return len(tg1.sends()) >= 1 })
 	settle()
 	_ = b1.Close()
 
@@ -335,4 +336,37 @@ func TestDBCompactOnBoot(t *testing.T) {
 	if countBucket(t, b, bucketChats) == 0 {
 		t.Fatal("compact lost chat records")
 	}
+}
+
+func TestFailedFlushRequeuesPending(t *testing.T) {
+	dir := t.TempDir()
+	cfg := dbTestConfig(dir, func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	b := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	// Swap in a read-only handle so every write transaction fails.
+	b.flushMu.Lock()
+	_ = b.db.Close()
+	ro, err := bolt.Open(cfg.DBFile, 0o600, &bolt.Options{ReadOnly: true})
+	if err != nil {
+		b.flushMu.Unlock()
+		t.Fatal(err)
+	}
+	b.db = ro
+	b.flushMu.Unlock()
+
+	b.mu.Lock()
+	b.dirtyMeta = true
+	b.rememberLocked("d:42", "user", "hello")
+	b.mu.Unlock()
+
+	if err := b.flushNow(); err == nil {
+		t.Fatal("expected a failed flush on a read-only database")
+	}
+	b.mu.Lock()
+	_, pending := b.pendingChats["d:42"]
+	meta := b.dirtyMeta
+	b.mu.Unlock()
+	if !pending || !meta {
+		t.Fatalf("pending work must be requeued: pending=%v meta=%v", pending, meta)
+	}
+	_ = b.Close()
 }
