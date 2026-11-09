@@ -118,6 +118,14 @@ LOAD_N=600 go test -run TestLoad -v .                      # load test (needs LO
 Only one process may poll a bot token. If a second poller runs, Telegram answers
 `409 Conflict` and the bridge backs off.
 
+## Resource usage
+
+Measured worst case on the reference workload (500 chats, 20 messages each, 8000 code
+points per chat, ASCII): **+5.0 MB live heap, +4.7 MB after restart, 8.0 MB `bridge.db`**;
+a full 500-chat snapshot flush takes ~23 ms (normal flushes write only dirty chats).
+`go test -run TestWorstCaseRamAndDisk -v .` reproduces the numbers; the bounds are pinned
+in that test so a regression fails the suite.
+
 ## License
 
 No license has been chosen yet. All rights reserved until one is added.

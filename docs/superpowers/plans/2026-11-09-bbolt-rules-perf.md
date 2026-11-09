@@ -1,6 +1,6 @@
 # bbolt + restart fixes + rules.md Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Bot bền (bridge.db), không replay backlog sau restart, chặn trần RAM/disk tự dọn dẹp, và bộ quy tắc `rules.md` AI tự tổng hợp không lưu dữ liệu nhạy cảm.
 
@@ -40,7 +40,7 @@ go get go.etcd.io/bbolt/v3@latest
 go mod tidy
 ```
 
-- [ ] **Step 2: Viết test thất bại (config defaults + clamp)** — tạo `config_test.go`:
+- [x] **Step 2: Viết test thất bại (config defaults + clamp)** — tạo `config_test.go`:
 
 ```go
 package main
@@ -109,12 +109,12 @@ func TestLoadConfigNewClamps(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Chạy test — THẤT BÁO** (trường chưa tồn tại, biên dịch lỗi)
+- [x] **Step 3: Chạy test — THẤT BÁO** (trường chưa tồn tại, biên dịch lỗi)
 
 Run: `go test -run 'TestLoadConfigNew' -count=1 .`
 Expected: FAIL — compile error `unknown field`.
 
-- [ ] **Step 4: Cài đặt — config.go**
+- [x] **Step 4: Cài đặt — config.go**
 
 Thêm vào `Config` (sau `LLMRetries`):
 
@@ -178,7 +178,7 @@ Khối clamp — thêm:
 
 (Ghi chú: `defaultConfig()` đặt `DBFile`/`RulesFile` rỗng — chỉ `loadConfig` mới ghi đường dẫn mặc định, để test dựng Bridge bằng `defaultConfig()` không mở DB.)
 
-- [ ] **Step 5: .gitignore** — thêm:
+- [x] **Step 5: .gitignore** — thêm:
 
 ```
 bridge.db
@@ -187,12 +187,12 @@ rules.md
 *.compact
 ```
 
-- [ ] **Step 6: Chạy toàn bộ test — XANH**
+- [x] **Step 6: Chạy toàn bộ test — XANH**
 
 Run: `go test -count=1 .`
 Expected: PASS (không test nào cũ bị hỏng: `TestPauseSurvivesRestart` dùng `defaultConfig()` với `DBFile=""` → chế độ nhớ RAM, bất biến với change).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```sh
 git add go.mod go.sum config.go .gitignore config_test.go
@@ -211,7 +211,7 @@ git commit -m "feat(config): bbolt + retention + rules config keys with clamps"
 **Interfaces:**
 - Produces: `Message.Date int64 `json:"date"`` (Task 6 dùng). Hành vi HTTP giữ nguyên (existing tests phải xanh).
 
-- [ ] **Step 1: Viết test thất bại** — thêm vào `bridge_test.go` (cuối file):
+- [x] **Step 1: Viết test thất bại** — thêm vào `bridge_test.go` (cuối file):
 
 ```go
 func TestMessageDateUnmarshalled(t *testing.T) {
@@ -226,12 +226,12 @@ func TestMessageDateUnmarshalled(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Chạy — THẤT BÁO**
+- [x] **Step 2: Chạy — THẤT BÁO**
 
 Run: `go test -run TestMessageDateUnmarshalled -count=1 .`
 Expected: FAIL, compile `m.Date undefined`.
 
-- [ ] **Step 3: Cài đặt**
+- [x] **Step 3: Cài đặt**
 
 `telegram.go` — struct `Message` thêm field (đặt sau `Chat`):
 
@@ -276,11 +276,11 @@ Xoá import `io` nếu không còn dùng? (io vẫn dùng: `LimitReader` — gi�
 		NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, llmHTTP))
 ```
 
-- [ ] **Step 4: Chạy toàn bộ — XANH** (bao gồm `TestTelegramBadJSONAnswerIsHandled`, `TestLLMRealHTTP*`, end-to-end — decode stream tương thích)
+- [x] **Step 4: Chạy toàn bộ — XANH** (bao gồm `TestTelegramBadJSONAnswerIsHandled`, `TestLLMRealHTTP*`, end-to-end — decode stream tương thích)
 
 Run: `go test -count=1 .` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add telegram.go llm.go main.go bridge_test.go
@@ -301,7 +301,7 @@ git commit -m "perf(http): stream-decode responses, one shared transport, m.date
 - Consumes: `Config.DBFile/FlushSec/MaxStoredChats...` (Task 1).
 - Produces: `b.openDB(path)`, `b.loadMetaDB()`, `b.loadLegacyState()`, `b.flushNow()`, `b.flushAll()`, `b.flushLoop(ctx)`, `b.Close() error`, `b.saveStateLocked()` (đổi nghĩa: db→dirty), `b.dbErr error`, fields `b.db *bbolt.DB`, `b.offset int64`, `b.dirtyMeta bool`. `chatRecord{Introduced bool; Updated int64; Msgs []ChatMsg}` (Task 4/5 dùng).
 
-- [ ] **Step 1: storage_test.go — test thất bại**
+- [x] **Step 1: storage_test.go — test thất bại**
 
 ```go
 package main
@@ -403,11 +403,11 @@ func TestDBLockedFailsWithClue(t *testing.T) {
 
 (Hàm helper dùng từ Task 3 ban olla đặt: dùng `os.WriteFile` trực tiếp — `osWriteFileForTest` KHÔNG NÊN xuất hiện: dùng `os.WriteFile(st, ..., 0o600)` và import `os`.)
 
-- [ ] **Step 2: Chạy — THẤT BÁO** (chưa có storage.go; compile fail `b1.db undefined`).
+- [x] **Step 2: Chạy — THẤT BÁO** (chưa có storage.go; compile fail `b1.db undefined`).
 
 Run: `go test -run 'TestMetaRoundTrip|TestLegacyStateMigration|TestDBLockedFailsWithClue' -count=1 .`
 
-- [ ] **Step 3: Cài đặt — tạo `storage.go`**
+- [x] **Step 3: Cài đặt — tạo `storage.go`**
 
 ```go
 package main
@@ -737,7 +737,7 @@ func pruneChatsTx(tx *bolt.Tx, now time.Time, cfg Config) {
 
 (Lưu ý: `flushLoop` nhận `ctx interface{ Done() <-chan struct{} }` để test có thể thay context chuẩn; production dùng `context.Context`.)
 
-- [ ] **Step 4: bridge.go cắm** — struct `Bridge` thêm:
+- [x] **Step 4: bridge.go cắm** — struct `Bridge` thêm:
 
 ```go
 	db           *bolt.DB
@@ -816,9 +816,9 @@ Cuối main thay `saveStateLocked` block:
 	logf("INFO", "stopped cleanly")
 ```
 
-- [ ] **Step 5: Chạy toàn bộ — XANH** (`go test -count=1 .` — `TestPauseSurvivesRestart` vẫn xanh vì mem-mode path giữ nguyên; storage tests xanh).
+- [x] **Step 5: Chạy toàn bộ — XANH** (`go test -count=1 .` — `TestPauseSurvivesRestart` vẫn xanh vì mem-mode path giữ nguyên; storage tests xanh).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```sh
 git add storage.go storage_test.go bridge.go main.go
@@ -838,7 +838,7 @@ git commit -m "feat(storage): bbolt meta layer with one-time state.json migratio
 - Consumes: `chatRecord`, `flushNow`, `dirtyChats` (Task 3).
 - Produces: `chatState.updated int64`, `chatState.runes int`, `chatRunes(msgs []ChatMsg) int` (Task 5 dùng).
 
-- [ ] **Step 1: test thất bại** — `storage_test.go` thêm:
+- [x] **Step 1: test thất bại** — `storage_test.go` thêm:
 
 ```go
 func TestChatHistoryRoundTrip(t *testing.T) {
@@ -894,7 +894,7 @@ func TestHistoryCharCap(t *testing.T) {
 
 (Chỉnh: harnessFor không tồn tại — dùng waitFor trực tiếp. Xem Step lamma dưới, chuẩn hoá final trong plan-exec.)
 
-- [ ] **Step 2: cài đặt bridge.go**
+- [x] **Step 2: cài đặt bridge.go**
 
 `chatState` thêm fields `updated int64`, `runes int`.
 
@@ -931,11 +931,11 @@ func chatRunes(msgs []ChatMsg) int {
 
 (config `HistoryMaxChars` clamp ≥200 nên lim luôn ≥1.)
 
-- [ ] **Step 3: chạy toàn bộ — XANH** (đặc biệt: `TestPauseSurvivesRestart` — mem-mode dirtyChats map được gọi nhưng db nil — vô hại).
+- [x] **Step 3: chạy toàn bộ — XANH** (đặc biệt: `TestPauseSurvivesRestart` — mem-mode dirtyChats map được gọi nhưng db nil — vô hại).
 
 Run: `go test -count=1 .`
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```sh
 git add bridge.go storage.go storage_test.go
@@ -954,7 +954,7 @@ git commit -m "feat(storage): durable chat history with per-chat rune cap"
 **Interfaces:**
 - Produces: `b.restoreChats()`, `b.maybeCompact()`.
 
-- [ ] **Step 1: tests** — thêm vào `storage_test.go`:
+- [x] **Step 1: tests** — thêm vào `storage_test.go`:
 
 ```go
 func TestRestoreOrderAndCap(t *testing.T) {
@@ -1103,9 +1103,9 @@ func TestDBCompactOnBoot(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: chạy — THẤT BÁO** (compile fail: no restoreChats/maybeCompact).
+- [x] **Step 2: chạy — THẤT BÁO** (compile fail: no restoreChats/maybeCompact).
 
-- [ ] **Step 3: cài đặt storage.go**
+- [x] **Step 3: cài đặt storage.go**
 
 ```go
 // restoreChats loads chat records newest-first into the LRU and marks
@@ -1220,11 +1220,11 @@ func (b *Bridge) maybeCompact() {
 
 (imports thêm cho storage.go: `errors` đã có; test dùng `errors` — nếu test file chưa import thì thêm.)
 
-- [ ] **Step 4: chạy toàn bộ — XANH.**
+- [x] **Step 4: chạy toàn bộ — XANH.**
 
 Run: `go test -count=1 .`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add storage.go storage_test.go bridge.go
@@ -1243,7 +1243,7 @@ git commit -m "feat(storage): restore chats newest-first, prune expired, compact
 - Consumes: `Message.Date` (Task 2), `Config.MaxBacklogMin` (Task 1).
 - Produces: reason `"stale"`.
 
-- [ ] **Step 1: test thất bại** — thêm vào `bridge_test.go`:
+- [x] **Step 1: test thất bại** — thêm vào `bridge_test.go`:
 
 ```go
 func TestBacklogMessagesAreSkipped(t *testing.T) {
@@ -1269,9 +1269,9 @@ func TestBacklogMessagesAreSkipped(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: chạy — THẤT BÁO** (got "queued").
+- [x] **Step 2: chạy — THẤT BÁO** (got "queued").
 
-- [ ] **Step 3: cài đặt** — `maybeReply` đổi signature thêm `date int64`:
+- [x] **Step 3: cài đặt** — `maybeReply` đổi signature thêm `date int64`:
 
 ```go
 func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64) string {
@@ -1284,9 +1284,9 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 
 Callers: `onBusinessMessage` → `b.maybeReply(key, m.Chat.ID, text, m.From, conn, m.Date)`; `onBotMessage` → `..., m.Date)`.
 
-- [ ] **Step 4: chạy toàn bộ — XANH.**
+- [x] **Step 4: chạy toàn bộ — XANH.**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add bridge.go bridge_test.go
@@ -1305,7 +1305,7 @@ git commit -m "fix(restart): skip messages older than max_backlog_min"
 - Consumes: `truncRunes`, `runeCount` (util.go).
 - Produces: `sanitizeRules(text, ownerTag string, allowURL bool, limit int) string`, `blocksQuoted(out string, sources []string) bool`, `parseDistillOutput(out string) (string, bool)`, `writeRulesAtomic(path, text string) error`, `b.loadRules()`, `const rulesHeader string`.
 
-- [ ] **Step 1: test thất bại** — tạo `rules_test.go`:
+- [x] **Step 1: test thất bại** — tạo `rules_test.go`:
 
 ```go
 package main
@@ -1416,9 +1416,9 @@ func TestWriteRulesAtomic(t *testing.T) {
 
 (Chỉnh nhỏ khi cài: `TestSanitizeKeepsMajorityClean` có dòng chứa giữa "bảo hành" sạch — OK; kéo tên helper khỏi test nếu rối: chỉ gọi trực tiếp `string(r[80:120])`.)
 
-- [ ] **Step 2: chạy — THẤT BÁO** (compile: undefined).
+- [x] **Step 2: chạy — THẤT BÁO** (compile: undefined).
 
-- [ ] **Step 3: cài đặt `rules.go`**
+- [x] **Step 3: cài đặt `rules.go`**
 
 ```go
 package main
@@ -1536,9 +1536,9 @@ func (b *Bridge) loadRules() {
 }
 ```
 
-- [ ] **Step 4: chạy `go test -run TestSanitize -run TestRules -count=1 .`` → PASS; toàn bộ → PASS.**
+- [x] **Step 4: chạy `go test -run TestSanitize -run TestRules -count=1 .`` → PASS; toàn bộ → PASS.**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add rules.go rules_test.go
@@ -1559,7 +1559,7 @@ git commit -m "feat(rules): sensitive-data sanitizer, verbatim guard, atomic fil
 - Consumes: Task 7 functions, `cfg.RulesUpdateEvery/RulesMaxChars/RulesAllowURL`, `saveStateLocked`, `callLLM`.
 - Produces: `b.rulesOn() bool`, `b.rulesNoteLocked() string`, `b.buildDistillInputLocked() (string, []string)`, `b.distillJob()`, `parseCommand(text) (cmd, args string)` (Task 9 dùng key/conn).
 
-- [ ] **Step 1: fakeLLM mở rộng** — `bridge_test.go`: struct thêm `replies []string`, `callIdx int`, `fn func([]ChatMsg) (string, bool)`; tail của `Chat` đổi:
+- [x] **Step 1: fakeLLM mở rộng** — `bridge_test.go`: struct thêm `replies []string`, `callIdx int`, `fn func([]ChatMsg) (string, bool)`; tail của `Chat` đổi:
 
 ```go
 	f.mu.Lock()
@@ -1582,7 +1582,7 @@ git commit -m "feat(rules): sensitive-data sanitizer, verbatim guard, atomic fil
 	return f.reply, nil
 ```
 
-- [ ] **Step 2: test thất bại** — thêm `rules_test.go`:
+- [x] **Step 2: test thất bại** — thêm `rules_test.go`:
 
 ```go
 func TestRulesInjectionAndDistill(t *testing.T) {
@@ -1631,7 +1631,7 @@ Case OFF: `/rules off` qua dm owner → distill không ghi file nữa (counter b
 
 Case verbatim: `fn` trả về chuỗi chứa 40 runes `hello from requester text` (cũng là message user đã gửi, đủ dài ≥80 runes qua repeat) → file KHÔNG tồn tại + giữ file cũ nếu có.
 
-- [ ] **Step 3: cài đặt bridge.go**
+- [x] **Step 3: cài đặt bridge.go**
 
 Thêm fields: `rulesEnabled bool`(sát với `cfg`), `rulesRunOn bool`, `rulesText string`, `rulesPending int`. Init trong NewBridge: `rulesEnabled: cfg.RulesEnabled, rulesRunOn: true` — SAU openDB (loadMetaDB có thể ghi đè rulesRunOn). `NewBridge` gọi `b.loadRules()` ngay sau gán prompt.
 
@@ -1841,9 +1841,9 @@ func parseCommand(text string) (cmd, args string) {
 
 (tạm: ownerCommand nhận `cmd string` = "cmd args"? — KHÔNG rối: đổi signature NGAY ở Task 9 sang (cmd, args). Task 8 dùng trung gian: nối `args` field để trường hợp `/rules reset` nhận — làm thẳng final signature trong Task 8 và Task 9 chỉ thêm dispatch business + /forget. Đơn giản hoá: Task 8 ĐỔI signature `ownerCommand(chatID int64, conn, key, cmd, args string)` ngay; Task 9 chỉ thêm dispatch business + /forget.)
 
-- [ ] **Step 4: mọi test — XANH.**
+- [x] **Step 4: mọi test — XANH.**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add rules.go bridge.go util.go bridge_test.go rules_test.go
@@ -1861,7 +1861,7 @@ git commit -m "feat(rules): self-synthesis loop with prompt injection and /rules
 **Interfaces:**
 - Consumes: `parseCommand` (Task 8), `dirtyChats/deletedChats` (Task 3-4).
 
-- [ ] **Step 1: test thất bại:**
+- [x] **Step 1: test thất bại:**
 
 ```go
 func TestOwnerCommandInsideBusinessChat(t *testing.T) {
@@ -1914,9 +1914,9 @@ func TestOwnerTextStillMutesChat(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: chạy — THẤT BÁO.**
+- [x] **Step 2: chạy — THẤT BÁO.**
 
-- [ ] **Step 3: cài đặt** — `onBusinessMessage` nhánh owner:
+- [x] **Step 3: cài đặt** — `onBusinessMessage` nhánh owner:
 
 ```go
 	if m.From != nil && m.From.ID == b.cfg.OwnerID {
@@ -1968,9 +1968,9 @@ Mọi `b.sendMsg(chatID, msg, "")` → `b.sendMsg(chatID, msg, conn)`. Help text
 		msg = "Lệnh: /pause /resume /status /reload /rules [reset|off|on] /forget"
 ```
 
-- [ ] **Step 4: chạy toàn bộ — XANH.**
+- [x] **Step 4: chạy toàn bộ — XANH.**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add bridge.go bridge_test.go
@@ -1987,7 +1987,7 @@ git commit -m "feat(commands): owner commands inside business chats plus /forget
 
 **Interfaces:** cuối cùng, chỉ nghiệm thu.
 
-- [ ] **Step 1: Integration test** — thêm vào `integration_test.go` (dựa fakeTelegramServer + fake LLM HTTP موجود; tạo LLM fake nhanh bằng httptest):
+- [x] **Step 1: Integration test** — thêm vào `integration_test.go` (dựa fakeTelegramServer + fake LLM HTTP موجود; tạo LLM fake nhanh bằng httptest):
 
 ```go
 func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
@@ -2053,9 +2053,9 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 
 (chỉnh: `newFakeTelegram` cần biến `first` set được từ ngoài — điều chỉnh hàm nhận hoặc set trường; chi tiết theo file hiện có.)
 
-- [ ] **Step 2: chạy — XANH** (nếu fail → chắc chắn `Run` seed offset hay defer sai: debug theo Task 3 implementation).
+- [x] **Step 2: chạy — XANH** (nếu fail → chắc chắn `Run` seed offset hay defer sai: debug theo Task 3 implementation).
 
-- [ ] **Step 3: README.md cập nhật**
+- [x] **Step 3: README.md cập nhật**
 
 - Features thêm bullet: durable memory (bridge.db + retention/compact), no-backlog restart, rules.md auto-synthesis + sanitizer.
 - Configuration: bảng keys mới (đúng mặc định/clamp của Task 1), giải thích `rules_enabled`, `rules_allow_url`, note `rules.md` AI tự viết — có thể sửa tay rồi `/reload`.
@@ -2063,9 +2063,9 @@ func TestIntegrationRestartDoesNotReplayBacklog(t *testing.T) {
 - Note migration: bridge.db tự sinh cạnh config; state.json được nhập 1 lần rồi bỏ qua; binary arm64 ước ~7.6 MB.
 - Owner commands section: thêm `/rules [reset|off|on]`, `/forget`.
 
-- [ ] **Step 4: version bump** — `main.go`: `const version = "1.1.0"`.
+- [x] **Step 4: version bump** — `main.go`: `const version = "1.1.0"`.
 
-- [ ] **Step 5: Nghiệm thu đầy đủ**
+- [x] **Step 5: Nghiệm thu đầy đủ**
 
 ```sh
 go vet ./...
@@ -2076,7 +2076,7 @@ ls -l /tmp/tg-bridge-arm64   # ≤ 8.0 MB
 
 Soi log test: không có nội dung tin/rules nào in ra.
 
-- [ ] **Step 6: Commit (+ tag nếu muốn)**
+- [x] **Step 6: Commit (+ tag nếu muốn)**
 
 ```sh
 git add integration_test.go README.md main.go
