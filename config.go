@@ -28,6 +28,18 @@ type Config struct {
 	MaxConcurrentLLM int    `json:"max_concurrent_llm"`
 	MaxChats         int    `json:"max_chats"`
 	LLMRetries       int    `json:"llm_retries"`
+	DBFile           string `json:"db_file"`
+	FlushSec         int    `json:"flush_sec"`
+	MemoryDays       int    `json:"memory_days"`
+	MaxStoredChats   int    `json:"max_stored_chats"`
+	MaxBacklogMin    int    `json:"max_backlog_min"`
+	HistoryMaxChars  int    `json:"history_max_chars"`
+	RulesEnabled     bool   `json:"rules_enabled"`
+	RulesFile        string `json:"rules_file"`
+	RulesMaxChars    int    `json:"rules_max_chars"`
+	RulesUpdateEvery int    `json:"rules_update_every"`
+	RulesAllowURL    bool   `json:"rules_allow_url"`
+	DBCompactMB      int    `json:"db_compact_mb"`
 }
 
 func defaultConfig() Config {
@@ -44,6 +56,15 @@ func defaultConfig() Config {
 		MaxConcurrentLLM: 8,
 		MaxChats:         500,
 		LLMRetries:       2,
+		FlushSec:         30,
+		MemoryDays:       7,
+		MaxStoredChats:   1000,
+		MaxBacklogMin:    10,
+		HistoryMaxChars:  8000,
+		RulesEnabled:     true,
+		RulesMaxChars:    4000,
+		RulesUpdateEvery: 10,
+		DBCompactMB:      20,
 	}
 }
 
@@ -72,6 +93,12 @@ func loadConfig(path string) (Config, error) {
 	if cfg.SystemPromptFile == "" {
 		cfg.SystemPromptFile = filepath.Join(filepath.Dir(path), "system_prompt.txt")
 	}
+	if cfg.DBFile == "" {
+		cfg.DBFile = filepath.Join(filepath.Dir(path), "bridge.db")
+	}
+	if cfg.RulesFile == "" {
+		cfg.RulesFile = filepath.Join(filepath.Dir(path), "rules.md")
+	}
 	if cfg.TelegramBase == "" {
 		cfg.TelegramBase = "https://api.telegram.org"
 	}
@@ -87,5 +114,18 @@ func loadConfig(path string) (Config, error) {
 	clamp(&cfg.LLMRetries, 0)
 	clamp(&cfg.MaxInputChars, 1)
 	clamp(&cfg.MaxReplyChars, 1)
+	clamp(&cfg.FlushSec, 5)
+	clamp(&cfg.MemoryDays, 1)
+	if cfg.MaxStoredChats < cfg.MaxChats {
+		cfg.MaxStoredChats = cfg.MaxChats
+	}
+	if cfg.MaxBacklogMin < 0 {
+		cfg.MaxBacklogMin = 0
+	}
+	clamp(&cfg.HistoryMaxChars, 200)
+	clamp(&cfg.RulesMaxChars, 200)
+	if cfg.RulesUpdateEvery < 2 {
+		cfg.RulesUpdateEvery = 2
+	}
 	return cfg, nil
 }

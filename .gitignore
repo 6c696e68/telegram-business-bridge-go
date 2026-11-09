@@ -4,6 +4,10 @@ tg-bridge-*
 *.test
 *.out
 testdata/
+bridge.db
+bridge.db.*
+rules.md
+*.compact
 # runtime secrets must never be committed
 config.json
 state.json
