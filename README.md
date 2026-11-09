@@ -38,7 +38,13 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   `/rules add …`, `/rules del P1 A2`, `/rules set …` (multi-line), `/rules edit <request>`,
   `/rules undo` (one level). Sensitive data is still rejected from learned rules; your own rules
   are saved as written.
-- Owner commands (owner only, private chat or a business chat): `/here`, `/away`, `/pause`, `/resume`,
+- `/tomtat` (alias `/summary`): summarise a conversation from its last 100 messages (customer, owner and
+  bot). In the private chat with the bot, `/tomtat` lists recent chats and `/tomtat 2` summarises one;
+  typed inside a customer chat it summarises that chat. The summary is always sent to the owner's
+  private chat, never to the customer (the command message itself is visible in that chat). The Bot API
+  cannot read history, so the bridge keeps its own log: on disk only, 500 characters per message,
+  20,000 per chat, expiring with `memory_days`, deleted by `/forget`; group chats are not logged.
+- Owner commands (owner only, private chat or a business chat): `/here`, `/away`, `/tomtat`, `/pause`, `/resume`,
   `/status`, `/stats`, `/reload`, `/rules [add|del|set|edit|undo|reset|off|on]`, `/forget`. In the
   private chat with the bot, the owner talks to an assistant that can also edit the rules.
 - Bursts are coalesced: consecutive messages within `debounce_ms` produce one reply that answers the

@@ -109,6 +109,11 @@ type Bridge struct {
 	ownerEditQueue  []string  // owner messages waiting for that job (guarded by mu)
 	ownerChat       []ChatMsg // short rolling context of the owner chat (guarded by mu)
 
+	// chat transcripts for /tomtat (transcript.go), guarded by mu
+	trPending   map[string]trPending // queued for the next flush (DB mode)
+	trMem       map[string]*trRecord // memory-only mode
+	summaryList []string             // chat keys of the last /tomtat listing
+
 	lastPrune time.Time
 	startedAt time.Time
 	ownerSeen time.Time // last observed owner activity (presence)
@@ -130,6 +135,8 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		llmSem:     make(chan struct{}, cfg.MaxConcurrentLLM),
 
 		pendingChats: map[string]chatRecord{},
+		trPending:    map[string]trPending{},
+		trMem:        map[string]*trRecord{},
 		deletedChats: map[string]struct{}{},
 
 		rulesEnabled: cfg.RulesEnabled,
@@ -339,6 +346,7 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 		cs := b.touchLocked(key)
 		cs.ownerGen = cs.userGen // the owner has answered everything so far
 		cs.chatID, cs.conn = m.Chat.ID, conn
+		b.recordTranscriptLocked(key, "o", "", text)
 		if text != "" {
 			b.rememberLocked(key, "assistant", text)
 		} else {
@@ -353,6 +361,9 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 	if !b.businessConnAllowed(conn) {
 		return "conn_rejected"
 	}
+	b.mu.Lock()
+	b.recordTranscriptLocked(key, "c", displayName(m.From), text)
+	b.mu.Unlock()
 	return b.maybeReply(key, m.Chat.ID, text, m.From, conn, m.Date)
 }
 
@@ -403,6 +414,11 @@ func (b *Bridge) onBotMessage(m *Message) string {
 		text = "Xin chào"
 	}
 	key := "d:" + strconv.FormatInt(m.Chat.ID, 10)
+	if ctype == "private" {
+		b.mu.Lock()
+		b.recordTranscriptLocked(key, "c", displayName(m.From), text)
+		b.mu.Unlock()
+	}
 	return b.maybeReply(key, m.Chat.ID, text, m.From, "", m.Date)
 }
 
@@ -466,6 +482,12 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			return "owner_edit"
 		}
 		msg = reply
+	case "/tomtat", "/summary":
+		reply, async := b.summaryCommand(chatID, conn, key, args)
+		if async {
+			return "owner_summary"
+		}
+		msg = reply
 	case "/stats":
 		st := b.snapshotRuntime()
 		b.mu.Lock()
@@ -494,6 +516,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		if conn == "" {
 			b.ownerChat = nil // /forget in the owner's own chat clears its context
 		}
+		b.forgetTranscriptLocked(key)
 		b.rulesGen++ // abort an in-flight distill that captured this chat
 		b.mu.Unlock()
 		logf("INFO", "owner forgot a chat")
@@ -537,7 +560,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			msg += "\nRules: tắt"
 		}
 	default:
-		msg = "Lệnh: /here /away /pause /resume /status /stats /reload /forget\n" +
+		msg = "Lệnh: /here /away /tomtat /pause /resume /status /stats /reload /forget\n" +
 			"Quy tắc: /rules (xem) · /rules add|del|set|edit|undo|reset|off|on\n" +
 			"Hoặc nhắn tự nhiên cho bot để sửa quy tắc."
 	}
@@ -789,6 +812,9 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	b.mu.Lock()
 	cs.introduced = true
 	cs.repliedGen = gen
+	if chatID > 0 { // private chats only; group/channel IDs are negative
+		b.recordTranscriptLocked(key, "b", "", reply)
+	}
 	cs.followupAfter = 0
 	if followup {
 		b.rateAllowLocked(cs.lastUID, true)

@@ -131,6 +131,9 @@ func (b *Bridge) openDB(path string) {
 		if _, e := tx.CreateBucketIfNotExists(bucketMeta); e != nil {
 			return e
 		}
+		if _, e := tx.CreateBucketIfNotExists(bucketTranscripts); e != nil {
+			return e
+		}
 		_, e := tx.CreateBucketIfNotExists(bucketChats)
 		return e
 	}); err != nil {
@@ -278,6 +281,8 @@ func (b *Bridge) flushNow() error {
 	b.pendingChats = map[string]chatRecord{}
 	del := b.deletedChats
 	b.deletedChats = map[string]struct{}{}
+	trs := b.trPending
+	b.trPending = map[string]trPending{}
 	b.mu.Unlock()
 
 	err := b.db.Update(func(tx *bolt.Tx) error {
@@ -301,10 +306,23 @@ func (b *Bridge) flushNow() error {
 				return e
 			}
 		}
+		// Transcripts: drop forgotten logs first, then append lines that
+		// arrived after the /forget.
+		if tb := tx.Bucket(bucketTranscripts); tb != nil {
+			for k := range del {
+				if e := tb.Delete([]byte(k)); e != nil {
+					return e
+				}
+			}
+		}
+		if e := flushTranscriptsTx(tx, trs); e != nil {
+			return e
+		}
 		// Pruning scans every record; run it at most hourly so the frequent
 		// offset flushes stay tiny.
 		if b.lastPrune.IsZero() || b.now().Sub(b.lastPrune) >= time.Hour {
 			pruneChatsTx(tx, b.now(), b.cfg)
+			pruneTranscriptsTx(tx, b.now(), b.cfg)
 			b.lastPrune = b.now()
 		}
 		return nil
@@ -326,6 +344,18 @@ func (b *Bridge) flushNow() error {
 		}
 		for k := range del {
 			b.deletedChats[k] = struct{}{}
+		}
+		// transcript lines: keep the failed batch before anything newer
+		for k, p := range trs {
+			if _, gone := b.deletedChats[k]; gone {
+				continue
+			}
+			newer := b.trPending[k]
+			if newer.title != "" {
+				p.title = newer.title
+			}
+			p.entries = append(p.entries, newer.entries...)
+			b.trPending[k] = p
 		}
 		b.mu.Unlock()
 	}
