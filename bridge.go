@@ -82,6 +82,7 @@ type Bridge struct {
 	chats       map[string]*chatState
 	lru         *list.List // front = most recently used
 	llmSem      chan struct{}
+	visionSem   chan struct{} // at most one image request in memory
 	llmActive   int
 	sysPrompt   string
 
@@ -134,6 +135,7 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		chats:      map[string]*chatState{},
 		lru:        list.New(),
 		llmSem:     make(chan struct{}, cfg.MaxConcurrentLLM),
+		visionSem:  make(chan struct{}, 1),
 
 		pendingChats: map[string]chatRecord{},
 		trPending:    map[string]trPending{},
@@ -349,7 +351,9 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 		cs.ownerGen = cs.userGen // the owner has answered everything so far
 		cs.images = nil
 		cs.chatID, cs.conn = m.Chat.ID, conn
-		b.recordTranscriptLocked(key, "o", "", content)
+		if !b.isStale(m.Date) { // replayed backlog would get wrong timestamps
+			b.recordTranscriptLocked(key, "o", "", content)
+		}
 		if content != "" {
 			b.rememberLocked(key, "assistant", content)
 		} else {
@@ -803,8 +807,7 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	go b.typingLoop(ctx, chatID, conn)
 
 	t0 := time.Now()
-	attachImages(msgs, b.downloadImages(ctx, imageIDs))
-	reply, err := b.callLLMVision(ctx, msgs)
+	reply, err := b.callWithImages(ctx, msgs, imageIDs)
 	cancel()
 	if err != nil {
 		logf("WARN", "llm error: %v", err)

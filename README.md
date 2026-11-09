@@ -39,9 +39,10 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   `/rules undo` (one level). Sensitive data is still rejected from learned rules; your own rules
   are saved as written.
 - Images: photos and images sent as files (customers and the owner's private chat) are downloaded and
-  sent to the model with the message (largest size ≤1280 px / 2 MB, up to 3 per reply). Images are
-  never stored: history, transcripts and the DB keep only "[Ảnh] caption". If the model rejects images,
-  the bot retries once without them and still answers. `vision: false` turns this off.
+  sent to the model with the message (largest size ≤1280 px / 2 MB, up to 3 per reply, 3 MB of images per
+  request). Only one image request is held in memory at a time (≈11 MB peak), text chats never wait for
+  it. Images are never stored: history, transcripts and the DB keep only "[Ảnh] caption". If the model
+  rejects images, the bot retries once without them and still answers. `vision: false` turns this off.
 - Replies: when a message replies to another one, the model sees
   `[Đang trả lời tin nhắn của khách/chủ/trợ lý AI: "…"]` (the selected quote if any) and the replied
   photo, so "còn màu đen không?" is understood in context.

@@ -65,7 +65,7 @@ type TextQuote struct {
 const (
 	photoMaxSide     = 1280    // vision models gain little from bigger images
 	photoPreferBytes = 2 << 20 // prefer sizes below this
-	imageMaxBytes    = 4 << 20 // hard cap for any downloaded image
+	imageMaxBytes    = 3 << 20 // hard cap for any downloaded image
 )
 
 // imageFileID returns the file to send to a vision model: the largest photo
@@ -85,8 +85,13 @@ func (m *Message) imageFileID() string {
 				best = i
 			}
 		}
-		if best < 0 {
-			best = 0 // Telegram lists sizes smallest first
+		if best < 0 { // nothing within limits: take the smallest, whatever the order
+			best = 0
+			for i, p := range m.Photo {
+				if p.Width*p.Height < m.Photo[best].Width*m.Photo[best].Height {
+					best = i
+				}
+			}
 		}
 		return m.Photo[best].FileID
 	}

@@ -18,7 +18,21 @@ import (
 // message replies to another one, the quoted content (and its image) is
 // included so the model knows what is being answered.
 
-const maxImagesPerRequest = 3
+const (
+	maxImagesPerRequest = 3
+	// imageBudgetBytes caps the raw image bytes of one request: base64 and the
+	// request body roughly triple it, and only one image request is held in
+	// memory at a time (visionSem), so the peak stays far below the router's
+	// 64 MiB Go memory limit. Real photos are 100-400 KB.
+	imageBudgetBytes = 3 << 20
+)
+
+// markerNeutral rewrites text that imitates the bridge's own markers, so a
+// customer cannot forge "[Đang trả lời tin nhắn của chủ: …]".
+func markerNeutral(s string) string {
+	s = strings.ReplaceAll(s, "[Đang trả lời", "(Đang trả lời")
+	return strings.ReplaceAll(s, "[Ảnh]", "(Ảnh)")
+}
 
 // senderLabel names the author of a replied-to message for the model.
 func (b *Bridge) senderLabel(m *Message) string {
@@ -42,7 +56,7 @@ func (b *Bridge) senderLabel(m *Message) string {
 
 // messageContent renders the body of a message for the model and the history.
 func messageContent(m *Message) string {
-	body := strings.TrimSpace(m.body())
+	body := markerNeutral(strings.TrimSpace(m.body()))
 	switch {
 	case m.imageFileID() != "" && body != "":
 		return "[Ảnh] " + body
@@ -68,7 +82,7 @@ func (b *Bridge) promptText(m *Message) string {
 	}
 	quoted := ""
 	if m.Quote != nil && strings.TrimSpace(m.Quote.Text) != "" {
-		quoted = strings.TrimSpace(m.Quote.Text)
+		quoted = markerNeutral(strings.TrimSpace(m.Quote.Text))
 	} else {
 		quoted = messageContent(rt)
 	}
@@ -121,14 +135,25 @@ func (b *Bridge) downloadImages(ctx context.Context, ids []string) []string {
 		ids = ids[len(ids)-maxImagesPerRequest:]
 	}
 	var urls []string
+	var total int64
 	for _, id := range ids {
+		left := int64(imageBudgetBytes) - total
+		if left <= 0 {
+			logf("WARN", "image download skipped: request image budget used")
+			break
+		}
+		limit := int64(imageMaxBytes)
+		if left < limit {
+			limit = left
+		}
 		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		data, err := d.DownloadFile(dctx, id, imageMaxBytes)
+		data, err := d.DownloadFile(dctx, id, limit)
 		cancel()
 		if err != nil {
 			logf("WARN", "image download skipped: %v", err)
 			continue
 		}
+		total += int64(len(data))
 		mime := http.DetectContentType(data)
 		if !strings.HasPrefix(mime, "image/") {
 			logf("WARN", "image download skipped: not an image (%s)", mime)
@@ -161,18 +186,48 @@ func hasImages(msgs []ChatMsg) bool {
 	return false
 }
 
-// visionRejected reports a provider error that typically means "this model
-// or payload cannot take images".
+var imageErrorHints = []string{"image", "vision", "multimodal", "multi-modal", "image_url", "content type", "content part", "unsupported content"}
+
+// visionRejected reports a provider error that means "this model or payload
+// cannot take images". 413/415 always qualify; 400/404/422 only when the
+// error body points at images (or is empty, so nothing contradicts it), to
+// avoid paying twice for unrelated failures such as an overlong context.
 func visionRejected(err error) bool {
 	var le *LLMError
 	if !errors.As(err, &le) || le.Kind != "http" {
 		return false
 	}
 	switch le.Status {
-	case 400, 404, 413, 415, 422:
+	case 413, 415:
 		return true
+	case 400, 404, 422:
+		if strings.TrimSpace(le.detail) == "" {
+			return true
+		}
+		for _, h := range imageErrorHints {
+			if strings.Contains(le.detail, h) {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// callWithImages downloads the chat's images and calls the model. Only one
+// image-bearing request is prepared and held in memory at a time; text-only
+// requests never wait for it.
+func (b *Bridge) callWithImages(ctx context.Context, msgs []ChatMsg, imageIDs []string) (string, error) {
+	if len(imageIDs) == 0 || !b.cfg.Vision {
+		return b.callLLM(ctx, msgs)
+	}
+	select {
+	case b.visionSem <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-b.visionSem }()
+	attachImages(msgs, b.downloadImages(ctx, imageIDs))
+	return b.callLLMVision(ctx, msgs)
 }
 
 const imageDroppedNote = "\n[Có ảnh đính kèm nhưng model AI hiện tại không đọc được ảnh.]"

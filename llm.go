@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -52,6 +53,9 @@ func (m ChatMsg) MarshalJSON() ([]byte, error) {
 type LLMError struct {
 	Status int
 	Kind   string
+	// detail is a bounded, lower-cased provider error body used only to
+	// classify failures; it is never logged or shown.
+	detail string
 }
 
 func (e *LLMError) Error() string {
@@ -135,14 +139,11 @@ func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 }
 
 func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg) (string, error) {
-	payload := map[string]any{"model": model, "messages": msgs, "max_tokens": l.MaxTokens}
-	if l.MaxTokens <= 0 {
-		payload["max_tokens"] = 1200
+	maxTokens := l.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1200
 	}
-	if l.Temperature > 0 {
-		payload["temperature"] = l.Temperature
-	}
-	body, err := json.Marshal(payload)
+	body, err := encodeChatRequest(model, msgs, maxTokens, l.Temperature)
 	if err != nil {
 		return "", &LLMError{Kind: "bad_response"}
 	}
@@ -158,7 +159,8 @@ func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg) (strin
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", &LLMError{Status: resp.StatusCode, Kind: "http"}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return "", &LLMError{Status: resp.StatusCode, Kind: "http", detail: strings.ToLower(string(raw))}
 	}
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
 	var d struct {
@@ -172,4 +174,86 @@ func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg) (strin
 		return "", &LLMError{Kind: "bad_response"}
 	}
 	return strings.TrimSpace(d.Choices[0].Message.Content), nil
+}
+
+// encodeChatRequest writes the request into one pre-sized buffer. Image data
+// URLs (base64, possibly megabytes) are copied once instead of going through
+// json.Marshal's intermediate buffers, which keeps memory flat on small
+// routers. The output is the same JSON the encoding/json form would produce.
+func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature float64) ([]byte, error) {
+	size := 256 + len(model)
+	for _, m := range msgs {
+		size += len(m.Content)*2 + 64
+		for _, u := range m.Images {
+			size += len(u) + 64
+		}
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	str := func(v string) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+		return nil
+	}
+	buf.WriteString(`{"model":`)
+	if err := str(model); err != nil {
+		return nil, err
+	}
+	buf.WriteString(`,"messages":[`)
+	for i, m := range msgs {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(`{"role":`)
+		if err := str(m.Role); err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"content":`)
+		if len(m.Images) == 0 {
+			if err := str(m.Content); err != nil {
+				return nil, err
+			}
+		} else {
+			buf.WriteString(`[{"type":"text","text":`)
+			if err := str(m.Content); err != nil {
+				return nil, err
+			}
+			buf.WriteByte('}')
+			for _, u := range m.Images {
+				buf.WriteString(`,{"type":"image_url","image_url":{"url":`)
+				if jsonSafe(u) {
+					buf.WriteByte('"')
+					buf.WriteString(u)
+					buf.WriteByte('"')
+				} else if err := str(u); err != nil {
+					return nil, err
+				}
+				buf.WriteString(`}}`)
+			}
+			buf.WriteByte(']')
+		}
+		buf.WriteByte('}')
+	}
+	buf.WriteString(`],"max_tokens":`)
+	buf.WriteString(strconv.Itoa(maxTokens))
+	if temperature > 0 {
+		buf.WriteString(`,"temperature":`)
+		buf.WriteString(strconv.FormatFloat(temperature, 'f', -1, 64))
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+// jsonSafe reports whether s can be emitted inside JSON quotes verbatim
+// (true for data: URLs with base64 payloads).
+func jsonSafe(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' || c >= 0x7f || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
 }

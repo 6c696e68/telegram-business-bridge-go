@@ -588,8 +588,7 @@ func (b *Bridge) ownerEditJob(chatID int64, conn, request string, imageIDs []str
 		{Role: "system", Content: ownerEditPrompt},
 		{Role: "user", Content: sb.String()},
 	}
-	attachImages(msgs, b.downloadImages(ctx, imageIDs))
-	out, err := b.callLLMVision(ctx, msgs)
+	out, err := b.callWithImages(ctx, msgs, imageIDs)
 	cancel()
 	if err != nil || strings.TrimSpace(out) == "" {
 		logf("WARN", "owner chat: llm error: %v", err)
