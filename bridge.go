@@ -122,6 +122,9 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		p = b.subst(defaultPrompt)
 	}
 	b.sysPrompt = p
+	if b.db != nil {
+		b.restoreChats()
+	}
 	return b
 }
 
@@ -465,9 +468,20 @@ func (b *Bridge) rememberLocked(key, role, content string) *chatState {
 	} else {
 		cs.msgs = append(cs.msgs, ChatMsg{Role: role, Content: content})
 	}
+	cs.updated = b.now().Unix()
+	// Cap total history by code points so worst-case RAM stays bounded.
+	lim := b.cfg.HistoryMaxChars
+	for len(cs.msgs) > 1 && chatRunes(cs.msgs) > lim {
+		cs.msgs = append([]ChatMsg(nil), cs.msgs[1:]...)
+	}
+	if len(cs.msgs) == 1 && chatRunes(cs.msgs) > lim {
+		cs.msgs[0].Content = truncRunes(cs.msgs[0].Content, lim)
+	}
 	if over := len(cs.msgs) - b.cfg.HistoryMessages; over > 0 {
 		cs.msgs = append([]ChatMsg(nil), cs.msgs[over:]...)
 	}
+	cs.runes = chatRunes(cs.msgs)
+	b.dirtyChats[key] = struct{}{}
 	return cs
 }
 

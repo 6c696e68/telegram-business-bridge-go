@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,4 +125,52 @@ func TestMemoryModeWritesNothing(t *testing.T) {
 	}
 	_ = context.Background()
 	_ = time.Second
+}
+
+func TestChatHistoryRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cfg := dbTestConfig(dir, func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	b1 := NewBridge(cfg, &fakeTG{}, &fakeLLM{reply: "Dạ em trả lời"})
+	clock := &fakeClock{t: time.Date(2026, 11, 9, 12, 0, 0, 0, time.Local)}
+	b1.now = clock.Now
+	b1.sleep = func(ctx context.Context, d time.Duration) {}
+
+	if got := b1.handleUpdate(dm(555, 555, "hello")); got != "queued" {
+		t.Fatalf("got %q", got)
+	}
+	waitFor(t, "reply sent", func() bool { return b1.tg != nil })
+	settle()
+	_ = b1.Close()
+
+	b2 := NewBridge(cfg, &fakeTG{}, &fakeLLM{})
+	defer func() { _ = b2.Close() }()
+	b2.mu.Lock()
+	defer b2.mu.Unlock()
+	cs := b2.chats["d:555"]
+	if cs == nil {
+		t.Fatal("chat not restored")
+	}
+	if len(cs.msgs) != 2 || cs.msgs[0].Content != "hello" {
+		t.Fatalf("restored chat wrong: %+v", cs.msgs)
+	}
+	if !cs.introduced || cs.runes == 0 || cs.updated == 0 {
+		t.Fatalf("flags wrong: introduced=%v runes=%d updated=%d", cs.introduced, cs.runes, cs.updated)
+	}
+}
+
+func TestHistoryCharCap(t *testing.T) {
+	h := newHarness(func(c *Config) { c.HistoryMaxChars = 300 })
+	for i := 0; i < 6; i++ {
+		h.b.handleUpdate(dm(int64(700+i), int64(700+i), strings.Repeat("x", 150)))
+		h.b.handleUpdate(dm(int64(700+i), int64(700+i), strings.Repeat("y", 150)))
+	}
+	waitSent(t, h, 12)
+	settle()
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	for key, cs := range h.b.chats {
+		if cs.runes > 300 {
+			t.Fatalf("chat %s exceeds rune cap: %d", key, cs.runes)
+		}
+	}
 }

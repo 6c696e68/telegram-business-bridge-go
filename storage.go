@@ -344,3 +344,55 @@ func pruneChatsTx(tx *bolt.Tx, now time.Time, cfg Config) {
 		}
 	}
 }
+
+// restoreChats loads chat records newest-first into the LRU. RAM is capped by
+// MaxChats (normal eviction); the disk copy stays until memory_days expires.
+func (b *Bridge) restoreChats() {
+	if b.db == nil {
+		return
+	}
+	type kvRec struct {
+		key string
+		rec chatRecord
+	}
+	all := make([]kvRec, 0, 32)
+	_ = b.db.View(func(tx *bolt.Tx) error {
+		ck := tx.Bucket(bucketChats)
+		if ck == nil {
+			return nil
+		}
+		return ck.ForEach(func(k, v []byte) error {
+			var r chatRecord
+			if e := json.Unmarshal(v, &r); e == nil {
+				all = append(all, kvRec{string(k), r})
+			}
+			return nil
+		})
+	})
+	sort.Slice(all, func(i, j int) bool { return all[i].rec.Updated > all[j].rec.Updated })
+	cutoff := b.now().Add(-time.Duration(b.cfg.MemoryDays) * 24 * time.Hour).Unix()
+	b.mu.Lock()
+	for _, it := range all {
+		if it.rec.Updated < cutoff {
+			b.deletedChats[it.key] = struct{}{}
+			continue
+		}
+		cs := &chatState{
+			key:        it.key,
+			introduced: it.rec.Introduced,
+			updated:    it.rec.Updated,
+			msgs:       it.rec.Msgs,
+		}
+		if cs.msgs == nil {
+			cs.msgs = []ChatMsg{}
+		}
+		cs.runes = chatRunes(cs.msgs)
+		cs.el = b.lru.PushFront(cs)
+		b.chats[it.key] = cs
+	}
+	b.mu.Unlock()
+	// Keep RAM within MaxChats; evicted records stay on disk until they expire.
+	b.mu.Lock()
+	b.evictLocked("")
+	b.mu.Unlock()
+}
