@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 )
 
 type ChatMsg struct {
@@ -32,6 +33,7 @@ type LLM struct {
 	key    string
 	models []string
 	hc     *http.Client
+	lastOK atomic.Int64 // index of the last model that answered successfully
 }
 
 // NewLLM keeps the single-model constructor used by tests and callers that
@@ -55,24 +57,43 @@ func NewLLMChain(apiBase, key string, models []string, hc *http.Client) *LLM {
 	}
 }
 
+// walkOrder rotates the chain so the model that answered last time is tried
+// first. Without this, every retry during a provider incident re-hits the
+// failing primary and multiplies provider load.
+func (l *LLM) walkOrder() []int {
+	n := len(l.models)
+	start := int(l.lastOK.Load())
+	if start < 0 || start >= n {
+		start = 0
+	}
+	order := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		order = append(order, (start+i)%n)
+	}
+	return order
+}
+
 // Chat sends an OpenAI-compatible chat completion request, advancing through
-// the fallback chain on retryable provider failures.
+// the fallback chain on retryable provider failures (429/5xx only).
 func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
+	order := l.walkOrder()
 	var lastErr error
-	for i, model := range l.models {
-		reply, err := l.chatOnce(ctx, model, msgs)
+	for pos, idx := range order {
+		reply, err := l.chatOnce(ctx, l.models[idx], msgs)
 		if err == nil {
+			l.lastOK.Store(int64(idx))
 			return reply, nil
 		}
 		lastErr = err
-		if i == len(l.models)-1 {
+		// Unified cancellation semantics for callers and tests.
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if pos == len(order)-1 {
 			break
 		}
 		var le *LLMError
 		if errors.As(err, &le) && le.Kind == "http" && (le.Status == 429 || le.Status >= 500) {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
 			continue
 		}
 		return "", err

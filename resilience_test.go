@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -155,5 +156,47 @@ func TestStatusShowsStorageAndRules(t *testing.T) {
 	}
 	if !strings.Contains(text, "Rules:") {
 		t.Fatalf("status missing rules line: %q", text)
+	}
+}
+
+func TestLLMFallbackPrefersLastGoodModel(t *testing.T) {
+	srv, seen := modelAwareServer(t, func(model string) (int, string) {
+		if model == "primary" {
+			return http.StatusTooManyRequests, ""
+		}
+		return http.StatusOK, "ok"
+	})
+	defer srv.Close()
+	llm := NewLLMChain(srv.URL, "k", []string{"primary", "backup"}, srv.Client())
+	if _, err := llm.Chat(context.Background(), []ChatMsg{{Role: "user", Content: "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := llm.Chat(context.Background(), []ChatMsg{{Role: "user", Content: "2"}}); err != nil {
+		t.Fatal(err)
+	}
+	models := seen()
+	if len(models) != 3 || models[2] != "backup" {
+		t.Fatalf("second call must start at the last good model: %v", models)
+	}
+}
+
+func TestLLMFallbackStopsOnCancelBetweenModels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv, seen := modelAwareServer(t, func(model string) (int, string) {
+		if model == "primary" {
+			cancel()
+			return http.StatusTooManyRequests, ""
+		}
+		return http.StatusOK, "ok"
+	})
+	defer srv.Close()
+	llm := NewLLMChain(srv.URL, "k", []string{"primary", "backup"}, srv.Client())
+	_, err := llm.Chat(ctx, []ChatMsg{{Role: "user", Content: "hi"}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	if models := seen(); len(models) != 1 {
+		t.Fatalf("cancel must stop the walk, requests=%v", models)
 	}
 }

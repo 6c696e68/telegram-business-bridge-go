@@ -25,8 +25,11 @@ It is built for low-memory routers (aarch64, ~9 MB RSS) but runs anywhere Go run
   per-chat character cap.
 - Retries on LLM 429/5xx/transport errors and on Telegram flood control (`retry_after`).
 - Fallback model chain: when the primary model keeps answering 429/5xx, the next configured
-  model is tried in the same request (`fallback_models`).
-- Graceful shutdown: in-flight replies get up to `shutdown_drain_sec` to finish before exit.
+  model is tried in the same request (`fallback_models`); once a fallback answers, later calls
+  start from it so an incident does not multiply provider load.
+- Graceful shutdown: in-flight replies get up to `shutdown_drain_sec` to finish before exit
+  (a long LLM call in its thinking phase can still hit the budget; replies in their final
+  generating/sending phase are protected).
 - Never logs message text, tokens or API keys. Errors are sanitized (the bot token is in the URL, so transport errors carry only a kind).
 - Long-poll loop with backoff, 409 conflict handling, clean shutdown on SIGTERM.
 
