@@ -416,8 +416,8 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		b.ownerSeen = time.Time{}
 		b.saveStateLocked()
 		b.mu.Unlock()
-		started := b.sweepPending()
-		msg = "▶️ Bot đang trực thay bạn."
+		started := b.sweepPending() // no-op unless followup_max_min is enabled
+		msg = "▶️ Bot đang trực thay bạn: tin khách nhắn từ bây giờ sẽ được trả lời."
 		if started > 0 {
 			msg += fmt.Sprintf(" Đang trả lời %d chat đang chờ.", started)
 		}

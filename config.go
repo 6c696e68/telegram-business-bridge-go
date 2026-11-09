@@ -69,7 +69,7 @@ func defaultConfig() Config {
 		ShutdownDrainSec: 15,
 		DebounceMS:       700,
 		OwnerAwayMinutes: 30,
-		FollowupMaxMin:   120,
+		FollowupMaxMin:   0, // opt-in: answering messages sent while the owner was online
 		MaxTokens:        1200,
 		StatsLogMin:      60,
 		FlushSec:         30,

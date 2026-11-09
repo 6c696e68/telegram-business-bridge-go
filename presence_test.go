@@ -36,10 +36,45 @@ func llmSaw(h *harness, needle string) bool {
 	return false
 }
 
-// The core requirement: the bot answers only after the owner has been
-// inactive for owner_away_minutes, and then answers whoever was left waiting.
-func TestPresenceBotWaitsUntilOwnerAwayThenFollowsUp(t *testing.T) {
-	h := newHarness(nil) // owner_away_minutes = 30, followup_max_min = 120
+// The owner's rule (screenshot 2026-11-09): counting from the owner's last
+// activity, only messages that arrive after owner_away_minutes are answered,
+// immediately. Messages sent while the owner was online are never answered
+// later by the bot.
+func TestPresenceOnlyMessagesAfterAwayAreAnswered(t *testing.T) {
+	h := newHarness(nil)                                       // defaults: owner_away_minutes = 30, follow-ups off
+	h.b.handleUpdate(biz(testConn, 690, testOwner, "chào bố")) // 22:12 owner active
+	h.clock.Advance(1 * time.Minute)                           // 22:13
+	if got := h.b.handleUpdate(biz(testConn, 690, 690, "vừa làm vừa mò")); got != "muted" {
+		t.Fatalf("message while the owner is around got %q", got)
+	}
+	if got := h.b.handleUpdate(biz(testConn, 691, 691, "ở chat khác")); got != "owner_online" {
+		t.Fatalf("other chat while the owner is around got %q", got)
+	}
+
+	h.clock.Advance(29 * time.Minute) // 22:42: owner silent for 30 minutes
+	if n := h.b.sweepPending(); n != 0 {
+		t.Fatalf("old messages must never be answered later, sweep started %d", n)
+	}
+	settle()
+	if n := len(businessSends(h)); n != 0 {
+		t.Fatalf("bot answered messages sent while the owner was online: %d", n)
+	}
+
+	// A new message after the away threshold is answered immediately.
+	if got := h.b.handleUpdate(biz(testConn, 690, 690, "đkm")); got != "queued" {
+		t.Fatalf("message after the owner went away got %q", got)
+	}
+	waitFor(t, "immediate reply", func() bool { return len(businessSends(h)) == 1 })
+	settle()
+	if n := len(businessSends(h)); n != 1 {
+		t.Fatalf("exactly one reply expected, got %d", n)
+	}
+}
+
+// Opt-in (followup_max_min > 0): customers left waiting are answered once the
+// owner has been away long enough.
+func TestPresenceOptInFollowupAnswersWaitingCustomers(t *testing.T) {
+	h := newHarness(func(c *Config) { c.FollowupMaxMin = 120 })
 	if got := h.b.handleUpdate(biz(testConn, 700, testOwner, "chào chị")); got != "owner_takeover" {
 		t.Fatalf("got %q", got)
 	}
@@ -141,16 +176,19 @@ func TestPresenceHereAndAwayCommands(t *testing.T) {
 		t.Fatalf("after /here got %q", got)
 	}
 	h.b.handleUpdate(dm(testOwner, testOwner, "/away"))
-	// /away confirmation + the immediate follow-up for chat 750
-	waitFor(t, "follow-up after /away", func() bool { return len(businessSends(h)) == 1 })
+	waitSent(t, h, 2) // /here + /away confirmations
+	settle()
+	if n := len(businessSends(h)); n != 0 {
+		t.Fatalf("/away must not answer messages sent before it, got %d", n)
+	}
 	if got := h.b.handleUpdate(biz(testConn, 751, 751, "hi")); got != "queued" {
 		t.Fatalf("after /away got %q", got)
 	}
-	waitFor(t, "normal reply", func() bool { return len(businessSends(h)) == 2 })
+	waitFor(t, "normal reply", func() bool { return len(businessSends(h)) == 1 })
 }
 
 func TestPresenceOwnerOnlineDuringLLMDropsReply(t *testing.T) {
-	h := newHarness(nil)
+	h := newHarness(func(c *Config) { c.FollowupMaxMin = 120 })
 	gate := make(chan struct{})
 	h.llm.block = gate
 	if got := h.b.handleUpdate(biz(testConn, 760, 760, "hỏi nhanh")); got != "queued" {
@@ -213,7 +251,10 @@ func TestPresenceStatusLine(t *testing.T) {
 
 func TestPresenceSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
-	cfg := dbTestConfig(dir, func(c *Config) { c.DBFile = filepath.Join(dir, "bridge.db") })
+	cfg := dbTestConfig(dir, func(c *Config) {
+		c.DBFile = filepath.Join(dir, "bridge.db")
+		c.FollowupMaxMin = 120
+	})
 
 	b1 := NewBridge(cfg, &fakeTG{conns: map[string]BusinessConnection{
 		testConn: ownerConn(testConn, testOwner, true, true),
@@ -323,7 +364,7 @@ func (f senderFunc) Call(ctx context.Context, method string, params any, out any
 }
 
 func TestFollowupFailureDoesNotBurnQuotaAndBacksOff(t *testing.T) {
-	h := newHarness(nil)
+	h := newHarness(func(c *Config) { c.FollowupMaxMin = 120 })
 	h.b.handleUpdate(biz(testConn, 810, testOwner, "online"))
 	h.b.handleUpdate(biz(testConn, 811, 811, "khách chờ"))
 	h.clock.Advance(31 * time.Minute)
@@ -391,7 +432,10 @@ func TestDeliveredReplyIsPersistedImmediately(t *testing.T) {
 }
 
 func TestPendingChatsAreNotEvicted(t *testing.T) {
-	h := newHarness(func(c *Config) { c.MaxChats = 1 })
+	h := newHarness(func(c *Config) {
+		c.MaxChats = 1
+		c.FollowupMaxMin = 120
+	})
 	h.b.handleUpdate(biz(testConn, 830, testOwner, "online"))
 	h.b.handleUpdate(biz(testConn, 831, 831, "khách A"))
 	h.b.handleUpdate(biz(testConn, 832, 832, "khách B"))

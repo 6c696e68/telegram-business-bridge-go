@@ -12,14 +12,14 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
 
 - Replies to Business messages through the owner's connection, and to direct messages and group mentions sent to the bot.
 - Ignores any business connection that does not belong to the configured owner, or that cannot reply.
-- Owner presence: the bot answers business chats **only after the owner has been inactive for
-  `owner_away_minutes` (default 30)**. Sending or editing a message in *any* business chat counts as
-  activity and silences every business chat; `/here` marks you online, `/away` hands over at once.
-  Customers who wrote while you were online are remembered and answered by a follow-up sweep
-  (every 10 s) once you have been away long enough, unless you answered them yourself or the
-  message is older than `followup_max_min` (default 120). Presence and waiting chats survive restarts (with the default `bridge.db` store).
-  The Bot API exposes no online/read status, so merely opening a chat cannot be detected — type a
-  message or send `/here`.
+- Owner presence: counting from the owner's last activity, the bot answers only customer messages
+  that arrive **after `owner_away_minutes` (default 30)** — immediately. Messages sent while you were
+  online are never answered later by the bot. Sending or editing a message in *any* business chat counts
+  as activity and silences every business chat; `/here` marks you online, `/away` hands over at once
+  (for new messages). The Bot API exposes no online/read status, so merely opening a chat cannot be
+  detected — type a message or send `/here`. Optional: `followup_max_min > 0` makes the bot also answer
+  customers left waiting once you are away (off by default). Presence survives restarts (with the
+  default `bridge.db` store).
 - Owner takeover: when the owner types in a chat, that chat also stays silent for `owner_mute_minutes`.
 - Durable memory in a single bbolt file (`bridge.db`): chat context, pause state, connections and the
   update offset survive restarts. Expired chats are pruned automatically (`memory_days`) and the file is
@@ -114,7 +114,7 @@ it can be deleted. Only one process may open the database at a time.
 | `stats_log_min` | 60 | minutes between non-sensitive stats log lines (0 = off) |
 | `debounce_ms` | 700 | wait this long for a burst before replying (0 = reply per message) |
 | `owner_away_minutes` | 30 | owner inactivity required before the bot answers business chats (0 = always answer) |
-| `followup_max_min` | 120 | max age of a waiting message the follow-up sweep will still answer (0 = no follow-ups) |
+| `followup_max_min` | 0 (off) | opt-in: answer messages sent while you were online, up to this age in minutes |
 | `max_tokens` | 1200 | completion token cap per reply |
 | `temperature` | 0 | sampling temperature; 0 keeps the provider default |
 | `health_addr` | `""` (off) | loopback address for `GET /healthz`, e.g. `127.0.0.1:8099` |
