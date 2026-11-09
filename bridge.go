@@ -105,7 +105,9 @@ type Bridge struct {
 	// rulesFileMu serialises every write of the rules files (owner edits,
 	// distillation, reset, undo, reload) so they cannot clobber each other.
 	rulesFileMu     sync.Mutex
-	ownerEditActive bool // a plain-language rules edit is running (guarded by mu)
+	ownerEditActive bool      // an owner-chat job is running (guarded by mu)
+	ownerEditQueue  []string  // owner messages waiting for that job (guarded by mu)
+	ownerChat       []ChatMsg // short rolling context of the owner chat (guarded by mu)
 
 	lastPrune time.Time
 	startedAt time.Time
@@ -382,7 +384,7 @@ func (b *Bridge) onBotMessage(m *Message) string {
 		// The owner's private chat with the bot is a control panel: plain
 		// messages edit the rules instead of being answered like a customer.
 		if strings.TrimSpace(text) == "" {
-			b.sendMsg(m.Chat.ID, "Gửi /rules để xem quy tắc, hoặc nhắn tự nhiên để sửa (ví dụ: \"thêm quy tắc: luôn hỏi số đơn hàng\").", "")
+			b.sendMsg(m.Chat.ID, "Mình chỉ đọc được tin chữ. Gửi /rules để xem quy tắc, hoặc nhắn để trò chuyện / sửa quy tắc.", "")
 			return "owner_cmd"
 		}
 		b.startOwnerEdit(m.Chat.ID, "", text)
@@ -489,6 +491,9 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			b.deletedChats[key] = struct{}{}
 		}
 		delete(b.mutedUntil, key)
+		if conn == "" {
+			b.ownerChat = nil // /forget in the owner's own chat clears its context
+		}
 		b.rulesGen++ // abort an in-flight distill that captured this chat
 		b.mu.Unlock()
 		logf("INFO", "owner forgot a chat")

@@ -3,11 +3,12 @@ package main
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-const editPromptPrefix = "You edit the rule files"
+const editPromptPrefix = "You are the owner's private assistant"
 
 func lastSentText(h *harness) string {
 	sends := h.tg.sends()
@@ -92,21 +93,93 @@ func TestOwnerEditQuestionChangesNothing(t *testing.T) {
 	}
 }
 
-func TestOwnerEditBadAnswerChangesNothing(t *testing.T) {
+// A plain-text answer that claims an edit must not change anything and the
+// owner must be told so (the bot used to "say" it edited without writing).
+func TestOwnerEditPlainTextClaimIsFlagged(t *testing.T) {
 	h, ai, pin := opsHarness(t)
 	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
 		if strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
-			return "Dạ em đã sửa rồi ạ", true // not JSON: must not be trusted
+			return "Dạ em đã sửa rồi ạ", true // not JSON: nothing may be written
 		}
 		return "ok", false
 	}
-	h.b.handleUpdate(dm(testOwner, testOwner, "sửa giúp"))
+	h.b.handleUpdate(dm(testOwner, testOwner, "sửa giúp quy tắc về giá"))
 	waitSent(t, h, 1)
-	if !strings.Contains(lastSentText(h), "chưa sửa gì") {
-		t.Fatalf("the owner must be told nothing changed: %q", lastSentText(h))
+	text := lastSentText(h)
+	if !strings.Contains(text, "Dạ em đã sửa rồi ạ") || !strings.Contains(text, "Chưa có quy tắc nào được thay đổi") {
+		t.Fatalf("the owner must see the answer and the honest note: %q", text)
 	}
 	if readFile(t, pin) != "- Luôn xưng em, không hứa hẹn thay chủ." || readFile(t, ai) != "- Rule AI cũ." {
-		t.Fatal("files changed on an unparseable answer")
+		t.Fatal("files changed on a plain-text answer")
+	}
+}
+
+// Screenshot 2026-11-09 23:14: an ordinary question got "AI trả lời không đúng
+// định dạng". Ordinary chat must just be answered.
+func TestOwnerOrdinaryChatIsAnswered(t *testing.T) {
+	h, ai, pin := opsHarness(t)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
+			return "Mình không có dữ liệu giá vàng theo thời gian thực, bạn xem trên trang SJC hoặc PNJ nhé.", true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "giá vàng ngày hôm nay"))
+	waitSent(t, h, 1)
+	text := lastSentText(h)
+	if strings.Contains(text, "⚠️") || strings.Contains(text, "định dạng") || strings.Contains(text, "Chưa có quy tắc") {
+		t.Fatalf("ordinary chat must be answered without warnings: %q", text)
+	}
+	if !strings.Contains(text, "giá vàng") {
+		t.Fatalf("answer missing: %q", text)
+	}
+	if readFile(t, pin) != "- Luôn xưng em, không hứa hẹn thay chủ." || readFile(t, ai) != "- Rule AI cũ." {
+		t.Fatal("ordinary chat must not touch the rule files")
+	}
+}
+
+func TestOwnerChatKeepsContext(t *testing.T) {
+	h, _, _ := opsHarness(t)
+	var inputs []string
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
+			inputs = append(inputs, msgs[1].Content)
+			return `{"reply":"Chào bạn!","owner_rules":null,"ai_rules":null}`, true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "xin chào"))
+	waitSent(t, h, 1)
+	h.b.handleUpdate(dm(testOwner, testOwner, "nhắc lại câu vừa rồi"))
+	waitSent(t, h, 2)
+	if len(inputs) != 2 || !strings.Contains(inputs[1], "owner: xin chào") || !strings.Contains(inputs[1], "assistant: Chào bạn!") {
+		t.Fatalf("second message must carry the previous exchange: %q", inputs)
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "/forget"))
+	waitSent(t, h, 3)
+	h.b.mu.Lock()
+	n := len(h.b.ownerChat)
+	h.b.mu.Unlock()
+	if n != 0 {
+		t.Fatal("/forget must clear the owner chat context")
+	}
+}
+
+func TestOwnerMalformedJSONIsNotSentRaw(t *testing.T) {
+	h, _, pin := opsHarness(t)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
+			return `{"reply":"ok","owner_rules":"- cắt dở`, true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "thêm quy tắc mới"))
+	waitSent(t, h, 1)
+	if text := lastSentText(h); strings.Contains(text, "owner_rules") || !strings.Contains(text, "không bị thay đổi") {
+		t.Fatalf("broken JSON must not be shown raw: %q", text)
+	}
+	if readFile(t, pin) != "- Luôn xưng em, không hứa hẹn thay chủ." {
+		t.Fatal("broken JSON must not change files")
 	}
 }
 
@@ -248,35 +321,45 @@ func TestParseOwnerEditTolerance(t *testing.T) {
 	}
 }
 
-// W1: a second edit while one is running is refused, never silently merged.
-func TestOwnerEditsAreSingleFlight(t *testing.T) {
+// W1: messages sent while one is being processed are queued and handled next,
+// from the then-current files: no edit is lost or silently overwritten.
+func TestOwnerMessagesAreQueuedNotLost(t *testing.T) {
 	h, _, pin := opsHarness(t)
 	gate := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
 	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
-		if strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
-			<-gate
-			return `{"reply":"ok","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- Thêm A.","ai_rules":null}`, true
+		if !strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
+			return "ok", false
 		}
-		return "ok", false
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			<-gate
+			return `{"reply":"thêm A","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.","ai_rules":null}`, true
+		}
+		// the queued request must be computed from the file that already has A
+		if !strings.Contains(msgs[1].Content, "- A.") || !strings.Contains(msgs[1].Content, "thêm B") {
+			return `{"reply":"sai ngữ cảnh","owner_rules":null,"ai_rules":null}`, true
+		}
+		return `{"reply":"thêm B","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B.","ai_rules":null}`, true
 	}
 	h.b.handleUpdate(dm(testOwner, testOwner, "thêm A"))
 	waitFor(t, "first edit running", func() bool { return h.b.ownerEditBusy() })
 	h.b.handleUpdate(dm(testOwner, testOwner, "thêm B"))
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules add C"))
 	waitSent(t, h, 1)
 	if !strings.Contains(lastSentText(h), "Đang xử lý") {
-		t.Fatalf("second edit must be refused while busy: %q", lastSentText(h))
-	}
-	h.b.handleUpdate(dm(testOwner, testOwner, "/rules add C"))
-	waitSent(t, h, 2)
-	if !strings.Contains(lastSentText(h), "Đang xử lý") {
-		t.Fatalf("explicit edits must wait too: %q", lastSentText(h))
+		t.Fatalf("explicit edits must wait while the owner chat is busy: %q", lastSentText(h))
 	}
 	close(gate)
 	waitSent(t, h, 3)
-	if got := readFile(t, pin); got != "- Luôn xưng em, không hứa hẹn thay chủ.\n- Thêm A." {
-		t.Fatalf("pinned = %q", got)
+	waitFor(t, "queue drained", func() bool { return !h.b.ownerEditBusy() })
+	if got := readFile(t, pin); got != "- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B." {
+		t.Fatalf("both queued edits must land: %q", got)
 	}
-	waitFor(t, "edit released", func() bool { return !h.b.ownerEditBusy() })
 }
 
 // W1b: if learned rules change while the LLM is thinking, the edit is refused.

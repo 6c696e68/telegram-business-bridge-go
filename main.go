@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const version = "1.6.0"
+const version = "1.6.1"
 
 func newHTTPClient(maxIdle int) *http.Client {
 	tr := &http.Transport{
