@@ -75,17 +75,20 @@ type Bridge struct {
 	// storage (storage.go). Only the flush worker/Close writes the DB.
 	db           *bolt.DB
 	dbErr        error
+	persistent   bool
 	offset       int64
 	dirtyMeta    bool
-	dirtyChats   map[string]struct{}
+	pendingChats map[string]chatRecord
 	deletedChats map[string]struct{}
 	flushMu      sync.Mutex
 
 	// rules (rules.go); keep here so storage meta can persist the switch.
-	rulesEnabled bool
-	rulesRunOn   bool
-	rulesText    string
-	rulesPending int
+	rulesEnabled  bool
+	rulesRunOn    bool
+	rulesText     string
+	rulesPending  int
+	rulesGen      int
+	distillActive bool
 }
 
 func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
@@ -102,7 +105,7 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		lru:        list.New(),
 		llmSem:     make(chan struct{}, cfg.MaxConcurrentLLM),
 
-		dirtyChats:   map[string]struct{}{},
+		pendingChats: map[string]chatRecord{},
 		deletedChats: map[string]struct{}{},
 
 		rulesEnabled: cfg.RulesEnabled,
@@ -115,6 +118,7 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 			return b
 		}
 		b.loadMetaDB()
+		b.persistent = b.db != nil
 	} else {
 		b.loadLegacyState()
 	}
@@ -365,6 +369,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		case "reset":
 			b.mu.Lock()
 			b.rulesText = ""
+			b.rulesGen++
 			b.mu.Unlock()
 			if b.cfg.RulesFile != "" {
 				_ = os.Remove(b.cfg.RulesFile)
@@ -374,6 +379,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		case "off":
 			b.mu.Lock()
 			b.rulesRunOn = false
+			b.rulesGen++
 			b.saveStateLocked()
 			b.mu.Unlock()
 			msg = "🚫 Đã tắt rules (không tổng hợp, không chèn)."
@@ -403,11 +409,12 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			b.lru.Remove(cs.el)
 			delete(b.chats, key)
 		}
-		delete(b.dirtyChats, key)
-		if b.db != nil {
+		delete(b.pendingChats, key)
+		if b.persistent {
 			b.deletedChats[key] = struct{}{}
 		}
 		delete(b.mutedUntil, key)
+		b.rulesGen++ // abort an in-flight distill that captured this chat
 		b.mu.Unlock()
 		logf("INFO", "owner forgot a chat")
 		msg = "🗑 Đã xoá ngữ cảnh chat này."
@@ -556,7 +563,7 @@ func (b *Bridge) rememberLocked(key, role, content string) *chatState {
 		cs.msgs = append([]ChatMsg(nil), cs.msgs[over:]...)
 	}
 	cs.runes = chatRunes(cs.msgs)
-	b.dirtyChats[key] = struct{}{}
+	b.markChatPendingLocked(key, cs)
 	return cs
 }
 

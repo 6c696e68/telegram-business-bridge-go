@@ -63,13 +63,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go b.flushLoop(ctx)
+	flushDone := make(chan struct{})
+	go func() {
+		b.flushLoop(ctx)
+		close(flushDone)
+	}()
 
 	if err := b.Run(ctx); err != nil {
 		logf("ERROR", "fatal: %v", err)
+		<-flushDone
 		_ = b.Close()
 		os.Exit(1)
 	}
-	_ = b.Close()
+	<-flushDone
+	if err := b.Close(); err != nil {
+		logf("WARN", "final flush failed: %s", err)
+	}
 	logf("INFO", "stopped cleanly")
 }

@@ -28,6 +28,12 @@ type chatRecord struct {
 	Msgs       []ChatMsg `json:"msgs"`
 }
 
+// recordMeta decodes only the timestamp; used by prune/restore scans so bulk
+// scans do not allocate whole histories.
+type recordMeta struct {
+	Updated int64 `json:"updated"`
+}
+
 type metaSnapshot struct {
 	Paused   bool
 	Offset   int64
@@ -81,6 +87,17 @@ func chatRunes(msgs []ChatMsg) int {
 		total += runeCount(msgs[i].Content)
 	}
 	return total
+}
+
+// markChatPendingLocked snapshots the chat for the next flush. Taking the copy
+// at mutation time (not at flush time) guarantees an evicted chat is still
+// persisted, and never reads a half-mutated history. Caller holds b.mu.
+func (b *Bridge) markChatPendingLocked(key string, cs *chatState) {
+	b.pendingChats[key] = chatRecord{
+		Introduced: cs.introduced,
+		Updated:    cs.updated,
+		Msgs:       append([]ChatMsg(nil), cs.msgs...),
+	}
 }
 
 // openDB opens the store, creates buckets, and runs the one-time migration
@@ -183,7 +200,7 @@ func (b *Bridge) loadLegacyState() {
 // does the IO); memory-only mode keeps the legacy atomic state.json write.
 // Caller holds b.mu.
 func (b *Bridge) saveStateLocked() {
-	if b.db != nil {
+	if b.persistent {
 		b.dirtyMeta = true
 		return
 	}
@@ -205,14 +222,15 @@ func (b *Bridge) saveStateLocked() {
 	}
 }
 
-// flushNow writes dirty meta/chats and prunes in one transaction. It is the
-// only writer of the database (single-writer invariant).
-func (b *Bridge) flushNow() {
-	if b.db == nil {
-		return
-	}
+// flushNow writes pending meta/chats, deletions and pruning in one
+// transaction. It is the only writer of the database besides boot-time setup.
+// Pending state is restored on failure so nothing is silently lost.
+func (b *Bridge) flushNow() error {
 	b.flushMu.Lock()
 	defer b.flushMu.Unlock()
+	if b.db == nil {
+		return nil
+	}
 
 	b.mu.Lock()
 	wantMeta := b.dirtyMeta
@@ -221,17 +239,8 @@ func (b *Bridge) flushNow() {
 		b.dirtyMeta = false
 		ms = metaSnapshotFromLocked(b)
 	}
-	recs := make(map[string]chatRecord, len(b.dirtyChats))
-	for k := range b.dirtyChats {
-		if cs, ok := b.chats[k]; ok {
-			recs[k] = chatRecord{
-				Introduced: cs.introduced,
-				Updated:    cs.updated,
-				Msgs:       append([]ChatMsg(nil), cs.msgs...),
-			}
-		}
-	}
-	b.dirtyChats = map[string]struct{}{}
+	pend := b.pendingChats
+	b.pendingChats = map[string]chatRecord{}
 	del := b.deletedChats
 	b.deletedChats = map[string]struct{}{}
 	b.mu.Unlock()
@@ -243,40 +252,59 @@ func (b *Bridge) flushNow() {
 			}
 		}
 		ck := tx.Bucket(bucketChats)
-		for k, r := range recs {
-			if v, e := json.Marshal(r); e == nil {
-				if e := ck.Put([]byte(k), v); e != nil {
-					return e
-				}
+		for k, r := range pend {
+			v, e := json.Marshal(r)
+			if e != nil {
+				continue
+			}
+			if e := ck.Put([]byte(k), v); e != nil {
+				return e
 			}
 		}
 		for k := range del {
-			_ = ck.Delete([]byte(k))
+			if e := ck.Delete([]byte(k)); e != nil {
+				return e
+			}
 		}
 		pruneChatsTx(tx, b.now(), b.cfg)
 		return nil
 	})
 	if err != nil {
 		logf("WARN", "db flush: %s", err)
+		// Requeue pending work; newer mutations (which set the maps again
+		// while the tx ran) win over this stale snapshot.
+		b.mu.Lock()
+		if wantMeta {
+			b.dirtyMeta = true
+		}
+		for k, v := range pend {
+			if _, newer := b.pendingChats[k]; !newer {
+				if _, gone := b.deletedChats[k]; !gone {
+					b.pendingChats[k] = v
+				}
+			}
+		}
+		for k := range del {
+			b.deletedChats[k] = struct{}{}
+		}
+		b.mu.Unlock()
 	}
+	return err
 }
 
-// flushAll snapshots every chat plus meta (shutdown path).
-func (b *Bridge) flushAll() {
-	if b.db == nil {
-		return
-	}
+// flushAll snapshots every in-memory chat plus meta (shutdown path).
+func (b *Bridge) flushAll() error {
 	b.mu.Lock()
 	b.dirtyMeta = true
-	for k := range b.chats {
-		b.dirtyChats[k] = struct{}{}
+	for k, cs := range b.chats {
+		b.markChatPendingLocked(k, cs)
 	}
 	b.mu.Unlock()
-	b.flushNow()
+	return b.flushNow()
 }
 
-// flushLoop writes at a fixed cadence while anything is dirty; it is the only
-// DB writer besides Close.
+// flushLoop writes at a fixed cadence while anything is pending; it is the
+// only DB writer during normal operation.
 func (b *Bridge) flushLoop(ctx context.Context) {
 	interval := time.Duration(b.cfg.FlushSec) * time.Second
 	if interval < 5*time.Second {
@@ -289,46 +317,57 @@ func (b *Bridge) flushLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			b.flushNow()
+			_ = b.flushNow()
 		}
 	}
 }
 
-// Close flushes everything and closes the database. No-op in memory-only mode.
+// Close joins the write path: final flush, then detach and close the DB.
+// Callers must stop the flush loop first (main joins it explicitly).
 func (b *Bridge) Close() error {
-	if b.db == nil {
+	if !b.persistent {
 		return nil
 	}
-	b.flushAll()
-	err := b.db.Close()
-	b.db = nil
-	return err
+	if err := b.flushAll(); err != nil {
+		logf("WARN", "final flush failed: %s", err)
+	}
+	b.flushMu.Lock()
+	db := b.db
+	if db != nil {
+		b.db = nil
+	}
+	b.flushMu.Unlock()
+	if db == nil {
+		return nil
+	}
+	return db.Close()
 }
 
-// pruneChatsTx deletes expired and surplus chat records inside tx.
+// pruneChatsTx deletes expired and surplus chat records inside tx, reading
+// only each record's timestamp.
 func pruneChatsTx(tx *bolt.Tx, now time.Time, cfg Config) {
 	ck := tx.Bucket(bucketChats)
 	if ck == nil {
 		return
 	}
 	cutoff := now.Add(-time.Duration(cfg.MemoryDays) * 24 * time.Hour).Unix()
-	type kvRec struct {
+	type keyTS struct {
 		key string
-		rec chatRecord
+		ts  int64
 	}
-	all := make([]kvRec, 0, 32)
+	all := make([]keyTS, 0, 64)
 	_ = ck.ForEach(func(k, v []byte) error {
-		var r chatRecord
-		if json.Unmarshal(v, &r) == nil {
-			all = append(all, kvRec{string(k), r})
-		} else {
-			all = append(all, kvRec{string(k), chatRecord{}}) // invalid → expired
+		var m recordMeta
+		if json.Unmarshal(v, &m) != nil {
+			all = append(all, keyTS{string(k), 0}) // invalid → expired
+			return nil
 		}
+		all = append(all, keyTS{string(k), m.Updated})
 		return nil
 	})
-	survivors := make([]kvRec, 0, len(all))
+	survivors := make([]keyTS, 0, len(all))
 	for _, it := range all {
-		if it.rec.Updated >= cutoff {
+		if it.ts >= cutoff {
 			survivors = append(survivors, it)
 		} else {
 			_ = ck.Delete([]byte(it.key))
@@ -336,66 +375,89 @@ func pruneChatsTx(tx *bolt.Tx, now time.Time, cfg Config) {
 	}
 	extra := len(survivors) - cfg.MaxStoredChats
 	if extra > 0 {
-		sort.Slice(survivors, func(i, j int) bool {
-			return survivors[i].rec.Updated > survivors[j].rec.Updated
-		})
+		sort.Slice(survivors, func(i, j int) bool { return survivors[i].ts > survivors[j].ts })
 		for _, it := range survivors[len(survivors)-extra:] {
 			_ = ck.Delete([]byte(it.key))
 		}
 	}
 }
 
-// restoreChats loads chat records newest-first into the LRU. RAM is capped by
-// MaxChats (normal eviction); the disk copy stays until memory_days expires.
+// restoreChats loads the newest MaxChats chats from disk into the LRU. The
+// first pass reads timestamps only; full histories are decoded solely for the
+// chats that fit in RAM, so restore memory stays bounded by MaxChats.
 func (b *Bridge) restoreChats() {
 	if b.db == nil {
 		return
 	}
-	type kvRec struct {
+	type keyTS struct {
 		key string
-		rec chatRecord
+		ts  int64
 	}
-	all := make([]kvRec, 0, 32)
+	all := make([]keyTS, 0, 64)
 	_ = b.db.View(func(tx *bolt.Tx) error {
 		ck := tx.Bucket(bucketChats)
 		if ck == nil {
 			return nil
 		}
 		return ck.ForEach(func(k, v []byte) error {
-			var r chatRecord
-			if e := json.Unmarshal(v, &r); e == nil {
-				all = append(all, kvRec{string(k), r})
+			var m recordMeta
+			if e := json.Unmarshal(v, &m); e != nil {
+				b.mu.Lock()
+				b.deletedChats[string(k)] = struct{}{}
+				b.mu.Unlock()
+				return nil
 			}
+			all = append(all, keyTS{string(k), m.Updated})
 			return nil
 		})
 	})
-	// Push oldest-first so the most recently updated chat ends at the LRU front.
-	sort.Slice(all, func(i, j int) bool { return all[i].rec.Updated < all[j].rec.Updated })
 	cutoff := b.now().Add(-time.Duration(b.cfg.MemoryDays) * 24 * time.Hour).Unix()
-	b.mu.Lock()
+	sort.Slice(all, func(i, j int) bool { return all[i].ts > all[j].ts })
+	fresh := all[:0]
 	for _, it := range all {
-		if it.rec.Updated < cutoff {
+		if it.ts < cutoff {
+			b.mu.Lock()
 			b.deletedChats[it.key] = struct{}{}
+			b.mu.Unlock()
 			continue
 		}
-		cs := &chatState{
-			key:        it.key,
-			introduced: it.rec.Introduced,
-			updated:    it.rec.Updated,
-			msgs:       it.rec.Msgs,
-		}
-		if cs.msgs == nil {
-			cs.msgs = []ChatMsg{}
-		}
-		cs.runes = chatRunes(cs.msgs)
-		cs.el = b.lru.PushFront(cs)
-		b.chats[it.key] = cs
+		fresh = append(fresh, it)
 	}
-	b.mu.Unlock()
-	// Keep RAM within MaxChats; evicted records stay on disk until they expire.
+	if len(fresh) > b.cfg.MaxChats {
+		fresh = fresh[:b.cfg.MaxChats]
+	}
 	b.mu.Lock()
-	b.evictLocked("")
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+	_ = b.db.View(func(tx *bolt.Tx) error {
+		ck := tx.Bucket(bucketChats)
+		if ck == nil {
+			return nil
+		}
+		// oldest first so the newest ends at the LRU front
+		for i := len(fresh) - 1; i >= 0; i-- {
+			raw := ck.Get([]byte(fresh[i].key))
+			if raw == nil {
+				continue
+			}
+			var rec chatRecord
+			if e := json.Unmarshal(raw, &rec); e != nil {
+				continue
+			}
+			cs := &chatState{
+				key:        fresh[i].key,
+				introduced: rec.Introduced,
+				updated:    rec.Updated,
+				msgs:       rec.Msgs,
+			}
+			if cs.msgs == nil {
+				cs.msgs = []ChatMsg{}
+			}
+			cs.runes = chatRunes(cs.msgs)
+			cs.el = b.lru.PushFront(cs)
+			b.chats[cs.key] = cs
+		}
+		return nil
+	})
 }
 
 // maybeCompact rewrites the DB when it exceeds db_compact_mb (boot only, while

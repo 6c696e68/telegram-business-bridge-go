@@ -137,21 +137,29 @@ func (f *fakeLLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 		}
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if len(f.errs) > 0 {
 		e := f.errs[0]
 		f.errs = f.errs[1:]
+		f.mu.Unlock()
 		return "", e
 	}
-	if f.fn != nil {
-		if out, ok := f.fn(msgs); ok {
+	fn := f.fn
+	reply := f.reply
+	queued := false
+	if f.callIdx < len(f.replies) {
+		reply = f.replies[f.callIdx]
+		f.callIdx++
+		queued = true
+	}
+	f.mu.Unlock()
+	// fn runs outside the lock: tests may block it to simulate a slow distill.
+	if fn != nil {
+		if out, ok := fn(msgs); ok {
 			return out, nil
 		}
 	}
-	if f.callIdx < len(f.replies) {
-		out := f.replies[f.callIdx]
-		f.callIdx++
-		return out, nil
+	if queued || reply != "" {
+		return reply, nil
 	}
 	return f.reply, nil
 }
@@ -1113,5 +1121,105 @@ func TestForgetInDirectChat(t *testing.T) {
 	h.b.mu.Unlock()
 	if still {
 		t.Fatal("owner DM context not cleared")
+	}
+}
+
+func TestDistillSingleFlight(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	var mu sync.Mutex
+	calls := 0
+	gate := make(chan struct{})
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			<-gate
+			return "- Rule once.", true
+		}
+		return "Được", false
+	}
+	for i := 0; i < 4; i++ {
+		h.b.handleUpdate(dm(610, 610, "msg"))
+	}
+	waitSent(t, h, 4)
+	waitFor(t, "first distill started", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls >= 1
+	})
+	settle() // let the second threshold fire while the first job is blocked
+	close(gate)
+	waitFor(t, "rules file", func() bool { _, err := os.Stat(rf); return err == nil })
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("distill must be single-flight, ran %d times", got)
+	}
+}
+
+func TestDistillAbortedByReset(t *testing.T) {
+	h, rf := rulesHarness(t, nil)
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	h.llm.fn = func(msgs []ChatMsg) (string, bool) {
+		if strings.HasPrefix(msgs[0].Content, "You maintain the long-term rules") {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-gate
+			return "- Should not persist.", true
+		}
+		return "ok", false
+	}
+	h.b.handleUpdate(dm(611, 611, "m1"))
+	h.b.handleUpdate(dm(611, 611, "m2"))
+	waitSent(t, h, 2)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("distill never started")
+	}
+	h.b.handleUpdate(dm(testOwner, testOwner, "/rules reset"))
+	close(gate)
+	settle()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(rf); err == nil {
+		t.Fatal("stale distill must not write after /rules reset")
+	}
+	h.b.mu.Lock()
+	rt := h.b.rulesText
+	h.b.mu.Unlock()
+	if rt != "" {
+		t.Fatalf("rulesText must stay cleared, got %q", rt)
+	}
+}
+
+func TestEvictedChatStillFlushed(t *testing.T) {
+	dir := t.TempDir()
+	h := newHarness(func(c *Config) {
+		c.DBFile = filepath.Join(dir, "bridge.db")
+		c.MaxChats = 1
+	})
+	defer func() { _ = h.b.Close() }()
+	h.b.handleUpdate(dm(1001, 1001, "first chat message"))
+	waitSent(t, h, 1)
+	h.b.handleUpdate(dm(1002, 1002, "second chat message"))
+	waitSent(t, h, 2)
+	settle()
+	h.b.mu.Lock()
+	_, inRAM := h.b.chats["d:1001"]
+	h.b.mu.Unlock()
+	if inRAM {
+		t.Fatal("expected first chat evicted from RAM")
+	}
+	if err := h.b.flushNow(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countBucket(t, h.b, bucketChats); n != 2 {
+		t.Fatalf("evicted chat lost on disk: %d records, want 2", n)
 	}
 }

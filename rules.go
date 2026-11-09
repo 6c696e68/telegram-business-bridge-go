@@ -13,15 +13,18 @@ var (
 	reEmail  = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
 	reURL    = regexp.MustCompile(`(?i)https?://|www\.|\.(com|net|vn|org|io|biz)\b`)
 	reDigits = regexp.MustCompile(`[0-9]{6,}`)
+	reSpaced = regexp.MustCompile(`(?:\+?\d[ .\-]?){9,}`)
 	reMoney  = regexp.MustCompile(`(?i)\d+[,.]?\d*\s*(vnd|đ|usd|\$|k\b|tr\b|triệu|tỷ)`)
 	reHandle = regexp.MustCompile(`@[A-Za-z0-9_]{3,}`)
 	reID     = regexp.MustCompile(`(?i)\bid\b[^0-9]{0,3}\d{3,}`)
+	reSecret = regexp.MustCompile(`(?i)(mật\s*khẩu|password|passwd|api[_ ]?key|secret|token)\s*[:=]\s*\S+`)
 )
 
 // lineBad reports a sensitive-data policy violation in one candidate rule line.
 func lineBad(line, ownerTag string, allowURL bool) bool {
 	if reEmail.MatchString(line) || reDigits.MatchString(line) ||
-		reMoney.MatchString(line) || reID.MatchString(line) {
+		reSpaced.MatchString(line) || reMoney.MatchString(line) ||
+		reID.MatchString(line) || reSecret.MatchString(line) {
 		return true
 	}
 	if !allowURL && reURL.MatchString(line) {
@@ -37,12 +40,21 @@ func lineBad(line, ownerTag string, allowURL bool) bool {
 
 // sanitizeRules filters distiller output line by line. "" means nothing usable
 // remained, or more than half the content lines were rejected (keep old file).
+// Headings are validated too: they can carry the same sensitive payload.
 func sanitizeRules(text, ownerTag string, allowURL bool, limit int) string {
 	lines := strings.Split(text, "\n")
 	kept, rejected := 0, 0
 	out := make([]string, 0, len(lines))
 	for _, ln := range lines {
-		if strings.TrimSpace(ln) == "" || strings.HasPrefix(ln, "#") {
+		if strings.TrimSpace(ln) == "" {
+			out = append(out, ln)
+			continue
+		}
+		if strings.HasPrefix(ln, "#") {
+			if lineBad(ln, ownerTag, allowURL) {
+				rejected++
+				continue
+			}
 			out = append(out, ln)
 			continue
 		}
@@ -59,21 +71,21 @@ func sanitizeRules(text, ownerTag string, allowURL bool, limit int) string {
 	return truncRunes(strings.Join(out, "\n"), limit)
 }
 
-// blocksQuoted reports whether out contains a 40-rune block copied from any
-// source conversation (windows at 0%, 25% and 50% of each source).
+// quoteWindow is the sliding-window size used to detect copied text. The
+// window advances one rune at a time so any 32+ rune verbatim copy is caught.
+const quoteWindow = 32
+
+// blocksQuoted reports whether out contains a near-verbatim block copied from
+// any source conversation (every 32-rune window of every source).
 func blocksQuoted(out string, sources []string) bool {
 	for _, src := range sources {
 		r := []rune(src)
 		n := len(r)
-		if n < 80 {
+		if n < quoteWindow {
 			continue
 		}
-		for i := 0; i < 3; i++ {
-			start := n * i / 4
-			if start+40 > n {
-				break
-			}
-			if strings.Contains(out, string(r[start:start+40])) {
+		for start := 0; start+quoteWindow <= n; start++ {
+			if strings.Contains(out, string(r[start:start+quoteWindow])) {
 				return true
 			}
 		}
@@ -178,13 +190,25 @@ func (b *Bridge) buildDistillInputLocked() (string, []string) {
 }
 
 // distillJob refreshes rules.md every rules_update_every successful replies.
-// It shares the LLM semaphore, never retries, and never persists sensitive or
-// verbatim content (sanitizer + quote guard).
+// It is single-flight, shares the LLM semaphore, never retries, and never
+// persists sensitive or verbatim content. A generation counter invalidates the
+// write when /rules reset|off or /forget runs while the LLM is thinking.
 func (b *Bridge) distillJob() {
 	b.mu.Lock()
+	if b.distillActive || !b.rulesOn() {
+		b.mu.Unlock()
+		return
+	}
+	b.distillActive = true
+	gen := b.rulesGen
 	input, srcs := b.buildDistillInputLocked()
 	cur := b.rulesText
 	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.distillActive = false
+		b.mu.Unlock()
+	}()
 
 	msgs := []ChatMsg{
 		{Role: "system", Content: distillSystemPrompt},
@@ -208,7 +232,15 @@ func (b *Bridge) distillJob() {
 		logf("WARN", "rules distill rejected: verbatim quote detected")
 		return
 	}
-	if clean == cur || b.cfg.RulesFile == "" {
+	if b.cfg.RulesFile == "" {
+		return
+	}
+
+	// Abort if the owner reset/disabled rules or forgot a chat meanwhile.
+	b.mu.Lock()
+	stillWanted := b.rulesOn() && b.rulesGen == gen && clean != cur
+	b.mu.Unlock()
+	if !stillWanted {
 		return
 	}
 	if err := writeRulesAtomic(b.cfg.RulesFile, clean); err != nil {
@@ -216,7 +248,9 @@ func (b *Bridge) distillJob() {
 		return
 	}
 	b.mu.Lock()
-	b.rulesText = clean
+	if b.rulesGen == gen {
+		b.rulesText = clean
+	}
 	b.mu.Unlock()
 	logf("INFO", "rules updated: %d chars", runeCount(clean))
 }

@@ -113,3 +113,50 @@ func TestWriteRulesAtomic(t *testing.T) {
 		t.Fatalf("rules file must be 0600, got %v", info.Mode())
 	}
 }
+
+func TestSanitizeHeadingValidated(t *testing.T) {
+	in := "## Hotline 0901234567\n- Khách hay hỏi về bảo hành.\n"
+	got := sanitizeRules(in, "@owner", false, 1000)
+	if strings.Contains(got, "0901234567") {
+		t.Fatalf("heading bypassed sanitizer: %q", got)
+	}
+	if !strings.Contains(got, "bảo hành") {
+		t.Fatalf("benign line lost: %q", got)
+	}
+}
+
+func TestSanitizeSpacedPhone(t *testing.T) {
+	in := "- Gọi 090 123 4567 nhé.\n- Hỗ trợ trong giờ hành chính.\n"
+	got := sanitizeRules(in, "@owner", false, 1000)
+	if strings.Contains(got, "090") {
+		t.Fatalf("spaced phone leaked: %q", got)
+	}
+}
+
+func TestSanitizeSecrets(t *testing.T) {
+	in := "- Password: hunter2xyz\n- Trả lời lịch sự.\n"
+	got := sanitizeRules(in, "@owner", false, 1000)
+	if strings.Contains(strings.ToLower(got), "password") {
+		t.Fatalf("secret leaked: %q", got)
+	}
+}
+
+func TestBlocksQuotedSliding(t *testing.T) {
+	source := strings.Repeat("abcdefghij", 20) // 200 runes
+	r := []rune(source)
+	for _, start := range []int{0, 5, 97, 100, 133, 160} {
+		if start+quoteWindow > len(r) {
+			continue
+		}
+		if !blocksQuoted(string(r[start:start+quoteWindow]), []string{source}) {
+			t.Fatalf("window at %d not detected", start)
+		}
+	}
+}
+
+func TestRulesSourceDistillGuardOnShortChat(t *testing.T) {
+	// sources shorter than the window are ignored (nothing to compare)
+	if blocksQuoted("short", []string{"tiny"}) {
+		t.Fatal("short sources must not match")
+	}
+}

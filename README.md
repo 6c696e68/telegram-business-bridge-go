@@ -84,15 +84,20 @@ it can be deleted. Only one process may open the database at a time.
 | `rules_update_every` | 10 | synthesise after every N successful replies |
 | `rules_allow_url` | false | allow URLs in rules (blocked by default) |
 
-The LLM rewrites the whole file (`UNCHANGED` means "no change"). Phone numbers, emails,
-URLs, foreign Telegram handles, money amounts, IDs and verbatim quotes are rejected by a
-line-level sanitizer; if more than half of the output looks sensitive the old file is kept.
-`/rules reset|off|on` and `/reload` manage it at runtime.
+The LLM rewrites the whole file (`UNCHANGED` means "no change"). Phone numbers (including
+spaced ones), emails, URLs, foreign Telegram handles, money amounts, IDs, secrets and
+verbatim quotes are rejected by a line-level sanitizer (headings included); if more than
+half of the output looks sensitive the old file is kept, and a distill that was in flight
+when you run `/rules reset|off` or `/forget` cannot write afterwards. This is a
+best-effort guard (strict prompt + regex + quote detector), not a hard guarantee — run
+`/rules` to review what was stored. `/rules reset|off|on` and `/reload` manage it at runtime.
 
 Telegram setup: in BotFather enable Business Mode for the bot, then in the owner's Telegram
 go to Settings → Telegram Business → Chatbots and add the bot with "Reply to messages".
 
 ## Build
+
+Requires Go 1.23 or newer (bbolt v1.4).
 
 ```sh
 go build -trimpath -ldflags="-s -w" -o tg-bridge .
