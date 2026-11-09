@@ -3,7 +3,6 @@ package main
 import (
 	"container/list"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -40,6 +41,8 @@ type chatState struct {
 	key        string
 	msgs       []ChatMsg
 	introduced bool
+	updated    int64
+	runes      int
 	active     int // reply jobs holding this chat; active chats are never evicted
 	lk         sync.Mutex
 	el         *list.Element
@@ -68,6 +71,19 @@ type Bridge struct {
 	llmSem     chan struct{}
 	llmActive  int
 	sysPrompt  string
+
+	// storage (storage.go). Only the flush worker/Close writes the DB.
+	db           *bolt.DB
+	dbErr        error
+	offset       int64
+	dirtyMeta    bool
+	dirtyChats   map[string]struct{}
+	deletedChats map[string]struct{}
+	flushMu      sync.Mutex
+
+	// rules (rules.go); keep here so storage meta can persist the switch.
+	rulesEnabled bool
+	rulesRunOn   bool
 }
 
 func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
@@ -83,9 +99,23 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		chats:      map[string]*chatState{},
 		lru:        list.New(),
 		llmSem:     make(chan struct{}, cfg.MaxConcurrentLLM),
+
+		dirtyChats:   map[string]struct{}{},
+		deletedChats: map[string]struct{}{},
+
+		rulesEnabled: cfg.RulesEnabled,
+		rulesRunOn:   true,
 	}
 	b.day = b.now().Format("2006-01-02")
-	b.loadState()
+	if cfg.DBFile != "" {
+		b.openDB(cfg.DBFile)
+		if b.dbErr != nil {
+			return b
+		}
+		b.loadMetaDB()
+	} else {
+		b.loadLegacyState()
+	}
 	p, err := b.readPrompt()
 	if err != nil {
 		logf("WARN", "prompt file unreadable, using default: %v", err)
@@ -128,46 +158,6 @@ func (b *Bridge) readPrompt() (string, error) {
 type persistedState struct {
 	Paused bool            `json:"paused"`
 	ConnOK map[string]bool `json:"conn_ok"`
-}
-
-func (b *Bridge) loadState() {
-	p := b.cfg.StateFile
-	if p == "" {
-		return
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return
-	}
-	var st persistedState
-	if err := json.Unmarshal(data, &st); err != nil {
-		logf("WARN", "state file unreadable, ignoring")
-		return
-	}
-	b.paused = st.Paused
-	if st.ConnOK != nil {
-		b.connOK = st.ConnOK
-	}
-}
-
-// saveStateLocked writes atomically (tmp file + rename). Caller holds b.mu.
-func (b *Bridge) saveStateLocked() {
-	p := b.cfg.StateFile
-	if p == "" {
-		return
-	}
-	data, err := json.Marshal(persistedState{Paused: b.paused, ConnOK: b.connOK})
-	if err != nil {
-		return
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		logf("WARN", "state save failed")
-		return
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		logf("WARN", "state rename failed")
-	}
 }
 
 // ---------- business connections & policy ----------
@@ -218,6 +208,7 @@ func (b *Bridge) rateOK(uid int64) bool {
 	now := b.now()
 	if today := now.Format("2006-01-02"); today != b.day {
 		b.day, b.dayCount = today, 0
+		b.saveStateLocked()
 	}
 	if b.dayCount >= b.cfg.DailyReplyCap {
 		return false
@@ -241,6 +232,7 @@ func (b *Bridge) rateOK(uid int64) bool {
 	}
 	b.userHits[uid] = append(hits, now)
 	b.dayCount++
+	b.saveStateLocked()
 	return true
 }
 
@@ -680,20 +672,28 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 	var offset int64
 	hasOffset := false
+	b.mu.Lock()
+	offset = b.offset
+	if offset > 0 {
+		hasOffset = true
+	}
+	b.mu.Unlock()
 	allowed := []string{"message", "business_connection", "business_message"}
 	backoff := time.Second
+	pollParams := map[string]any{"timeout": 50, "allowed_updates": allowed}
 
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		params := map[string]any{"timeout": 50, "allowed_updates": allowed}
 		if hasOffset {
-			params["offset"] = offset
+			pollParams["offset"] = offset
+		} else {
+			delete(pollParams, "offset")
 		}
 		var updates []Update
 		pctx, pcancel := context.WithTimeout(ctx, 65*time.Second)
-		err := b.tg.Call(pctx, "getUpdates", params, &updates)
+		err := b.tg.Call(pctx, "getUpdates", pollParams, &updates)
 		pcancel()
 
 		if err != nil {
@@ -729,6 +729,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 			if res := b.safeHandle(u); res != "" {
 				logf("INFO", "update %d -> %s", u.UpdateID, res)
 			}
+		}
+		if len(updates) > 0 {
+			b.mu.Lock()
+			b.offset = offset
+			b.dirtyMeta = true
+			b.mu.Unlock()
 		}
 	}
 }

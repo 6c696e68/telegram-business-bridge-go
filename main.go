@@ -55,16 +55,21 @@ func main() {
 	hc := newHTTPClient(4)
 	b := NewBridge(cfg, NewTelegram(cfg.TelegramBase, cfg.BotToken, hc),
 		NewLLM(cfg.APIBase, cfg.APIKey, cfg.Model, hc))
+	if b.dbErr != nil {
+		logf("ERROR", "%s", b.dbErr.Error())
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	go b.flushLoop(ctx)
+
 	if err := b.Run(ctx); err != nil {
 		logf("ERROR", "fatal: %v", err)
+		_ = b.Close()
 		os.Exit(1)
 	}
-	b.mu.Lock()
-	b.saveStateLocked()
-	b.mu.Unlock()
+	_ = b.Close()
 	logf("INFO", "stopped cleanly")
 }
