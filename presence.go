@@ -135,6 +135,7 @@ func (b *Bridge) sweepPending() int {
 		}
 		cs.followupAfter = now.Add(followupRetryAfter).Unix()
 		cs.active++
+		cs.looping = true
 		jobs = append(jobs, job{cs, key, cs.chatID, cs.conn})
 	}
 	b.mu.Unlock()
@@ -144,7 +145,7 @@ func (b *Bridge) sweepPending() int {
 		b.jobWG.Add(1)
 		go func() {
 			defer b.jobWG.Done()
-			b.replyJobOpt(j.cs, j.key, j.chatID, j.conn, true)
+			b.replyLoop(j.cs, j.key, j.chatID, j.conn, true)
 		}()
 	}
 	if len(jobs) > 0 {

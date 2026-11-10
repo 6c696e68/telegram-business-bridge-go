@@ -31,7 +31,19 @@ type Config struct {
 	FallbackModels   []string `json:"fallback_models"`
 	ShutdownDrainSec int      `json:"shutdown_drain_sec"`
 	DebounceMS       int      `json:"debounce_ms"`
+	DebounceMaxMS    int      `json:"debounce_max_ms"`
+	OwnerDebounceMS  int      `json:"owner_debounce_ms"`
 	Vision           bool     `json:"vision"`
+	VisionModel      string   `json:"vision_model"` // empty = the main model handles images too
+	VisionAPIBase    string   `json:"vision_api_base"`
+	VisionAPIKey     string   `json:"vision_api_key"`
+	TranscribeModel  string   `json:"transcribe_model"` // empty = voice notes are not transcribed
+	TranscribeBase   string   `json:"transcribe_api_base"`
+	TranscribeKey    string   `json:"transcribe_api_key"`
+	MaxVoiceSec      int      `json:"max_voice_sec"`
+	QuoteURL         string   `json:"quote_url"` // empty = the price tool is off
+	QuoteTimeoutMS   int      `json:"quote_timeout_ms"`
+	QuoteCacheSec    int      `json:"quote_cache_sec"`
 	OwnerAwayMinutes int      `json:"owner_away_minutes"`
 	FollowupMaxMin   int      `json:"followup_max_min"`
 	MaxTokens        int      `json:"max_tokens"`
@@ -69,7 +81,12 @@ func defaultConfig() Config {
 		LLMRetries:       2,
 		ShutdownDrainSec: 15,
 		DebounceMS:       700,
+		DebounceMaxMS:    2500,
+		OwnerDebounceMS:  1500,
 		Vision:           true,
+		MaxVoiceSec:      120,
+		QuoteTimeoutMS:   3000,
+		QuoteCacheSec:    10,
 		OwnerAwayMinutes: 30,
 		FollowupMaxMin:   0, // opt-in: answering messages sent while the owner was online
 		MaxTokens:        1200,
@@ -157,11 +174,31 @@ func loadConfig(path string) (Config, error) {
 	if cfg.DebounceMS < 0 {
 		cfg.DebounceMS = 0
 	}
+	if cfg.DebounceMaxMS < 0 {
+		cfg.DebounceMaxMS = 0
+	}
+	if cfg.DebounceMaxMS > 0 && cfg.DebounceMaxMS < cfg.DebounceMS {
+		cfg.DebounceMaxMS = cfg.DebounceMS
+	}
+	if cfg.OwnerDebounceMS < 0 {
+		cfg.OwnerDebounceMS = 0
+	}
 	if cfg.OwnerAwayMinutes < 0 {
 		cfg.OwnerAwayMinutes = 0
 	}
 	if cfg.FollowupMaxMin < 0 {
 		cfg.FollowupMaxMin = 0
+	}
+	clamp(&cfg.MaxVoiceSec, 1)
+	if cfg.MaxVoiceSec > 300 {
+		cfg.MaxVoiceSec = 300
+	}
+	clamp(&cfg.QuoteTimeoutMS, 200)
+	if cfg.QuoteTimeoutMS > 15000 {
+		cfg.QuoteTimeoutMS = 15000
+	}
+	if cfg.QuoteCacheSec < 0 {
+		cfg.QuoteCacheSec = 0
 	}
 	if cfg.MaxTokens <= 0 {
 		cfg.MaxTokens = 1200

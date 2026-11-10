@@ -19,17 +19,50 @@ type ChatMsg struct {
 	// Images are data: URLs sent to vision models with this message only.
 	// They are never stored in history or on disk.
 	Images []string `json:"-"`
+	// ToolCalls is set on an assistant message that asked for tools;
+	// ToolCallID/Name are set on the tool message that answers one.
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// ToolCall is one tool request from the model.
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// Tool describes a callable function in the OpenAI tools format.
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// ChatResult is one assistant message: text, tool calls, or both.
+type ChatResult struct {
+	Content   string
+	ToolCalls []ToolCall
+}
+
+// ToolCompleter is implemented by clients that can ask for tool calls. The
+// bridge checks for it at run time so a plain Completer keeps working.
+type ToolCompleter interface {
+	ChatTools(ctx context.Context, msgs []ChatMsg, tools []Tool) (ChatResult, error)
 }
 
 // MarshalJSON emits the plain OpenAI form, or the multimodal content array
-// when images are attached.
+// when images are attached, plus any tool fields.
 func (m ChatMsg) MarshalJSON() ([]byte, error) {
-	if len(m.Images) == 0 {
-		return json.Marshal(struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		}{m.Role, m.Content})
-	}
 	type urlPart struct {
 		URL string `json:"url"`
 	}
@@ -38,14 +71,23 @@ func (m ChatMsg) MarshalJSON() ([]byte, error) {
 		Text     string   `json:"text,omitempty"`
 		ImageURL *urlPart `json:"image_url,omitempty"`
 	}
+	out := struct {
+		Role       string     `json:"role"`
+		Content    any        `json:"content"`
+		ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+		Name       string     `json:"name,omitempty"`
+	}{Role: m.Role, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID, Name: m.Name}
+	if len(m.Images) == 0 {
+		out.Content = m.Content
+		return json.Marshal(out)
+	}
 	parts := []part{{Type: "text", Text: m.Content}}
 	for _, u := range m.Images {
 		parts = append(parts, part{Type: "image_url", ImageURL: &urlPart{URL: u}})
 	}
-	return json.Marshal(struct {
-		Role    string `json:"role"`
-		Content []part `json:"content"`
-	}{m.Role, parts})
+	out.Content = parts
+	return json.Marshal(out)
 }
 
 // LLMError never contains the API key or URL. Kind is one of:
@@ -113,18 +155,28 @@ func (l *LLM) walkOrder() []int {
 // Chat sends an OpenAI-compatible chat completion request, advancing through
 // the fallback chain on retryable provider failures (429/5xx only).
 func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
+	res, err := l.ChatTools(ctx, msgs, nil)
+	if err != nil {
+		return "", err
+	}
+	return res.Content, nil
+}
+
+// ChatTools is Chat with tool definitions. It reports tool calls instead of
+// dropping them, so the caller can run them and ask again.
+func (l *LLM) ChatTools(ctx context.Context, msgs []ChatMsg, tools []Tool) (ChatResult, error) {
 	order := l.walkOrder()
 	var lastErr error
 	for pos, idx := range order {
-		reply, err := l.chatOnce(ctx, l.models[idx], msgs)
+		res, err := l.chatOnce(ctx, l.models[idx], msgs, tools)
 		if err == nil {
 			l.lastOK.Store(int64(idx))
-			return reply, nil
+			return res, nil
 		}
 		lastErr = err
 		// Unified cancellation semantics for callers and tests.
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return ChatResult{}, ctx.Err()
 		}
 		if pos == len(order)-1 {
 			break
@@ -133,54 +185,58 @@ func (l *LLM) Chat(ctx context.Context, msgs []ChatMsg) (string, error) {
 		if errors.As(err, &le) && le.Kind == "http" && (le.Status == 429 || le.Status >= 500) {
 			continue
 		}
-		return "", err
+		return ChatResult{}, err
 	}
-	return "", lastErr
+	return ChatResult{}, lastErr
 }
 
-func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg) (string, error) {
+func (l *LLM) chatOnce(ctx context.Context, model string, msgs []ChatMsg, tools []Tool) (ChatResult, error) {
 	maxTokens := l.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 1200
 	}
-	body, err := encodeChatRequest(model, msgs, maxTokens, l.Temperature)
+	body, err := encodeChatRequest(model, msgs, maxTokens, l.Temperature, tools...)
 	if err != nil {
-		return "", &LLMError{Kind: "bad_response"}
+		return ChatResult{}, &LLMError{Kind: "bad_response"}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.url, bytes.NewReader(body))
 	if err != nil {
-		return "", &LLMError{Kind: "conn"}
+		return ChatResult{}, &LLMError{Kind: "conn"}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.key)
 	resp, err := l.hc.Do(req)
 	if err != nil {
-		return "", &LLMError{Kind: netKind(err)}
+		return ChatResult{}, &LLMError{Kind: netKind(err)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		return "", &LLMError{Status: resp.StatusCode, Kind: "http", detail: strings.ToLower(string(raw))}
+		return ChatResult{}, &LLMError{Status: resp.StatusCode, Kind: "http", detail: strings.ToLower(string(raw))}
 	}
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 4<<20))
 	var d struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := dec.Decode(&d); err != nil || len(d.Choices) == 0 {
-		return "", &LLMError{Kind: "bad_response"}
+		return ChatResult{}, &LLMError{Kind: "bad_response"}
 	}
-	return strings.TrimSpace(d.Choices[0].Message.Content), nil
+	return ChatResult{
+		Content:   strings.TrimSpace(d.Choices[0].Message.Content),
+		ToolCalls: d.Choices[0].Message.ToolCalls,
+	}, nil
 }
 
 // encodeChatRequest writes the request into one pre-sized buffer. Image data
 // URLs (base64, possibly megabytes) are copied once instead of going through
 // json.Marshal's intermediate buffers, which keeps memory flat on small
 // routers. The output is the same JSON the encoding/json form would produce.
-func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature float64) ([]byte, error) {
+func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature float64, tools ...Tool) ([]byte, error) {
 	size := 256 + len(model)
 	for _, m := range msgs {
 		size += len(m.Content)*2 + 64
@@ -238,6 +294,26 @@ func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature 
 			}
 			buf.WriteByte(']')
 		}
+		if len(m.ToolCalls) > 0 {
+			b, err := json.Marshal(m.ToolCalls)
+			if err != nil {
+				return nil, err
+			}
+			buf.WriteString(`,"tool_calls":`)
+			buf.Write(b)
+		}
+		if m.ToolCallID != "" {
+			buf.WriteString(`,"tool_call_id":`)
+			if err := str(m.ToolCallID); err != nil {
+				return nil, err
+			}
+		}
+		if m.Name != "" {
+			buf.WriteString(`,"name":`)
+			if err := str(m.Name); err != nil {
+				return nil, err
+			}
+		}
 		buf.WriteByte('}')
 	}
 	buf.WriteString(`],"max_tokens":`)
@@ -245,6 +321,14 @@ func encodeChatRequest(model string, msgs []ChatMsg, maxTokens int, temperature 
 	if temperature > 0 {
 		buf.WriteString(`,"temperature":`)
 		buf.WriteString(strconv.FormatFloat(temperature, 'f', -1, 64))
+	}
+	if len(tools) > 0 {
+		b, err := json.Marshal(tools)
+		if err != nil {
+			return nil, err
+		}
+		buf.WriteString(`,"tools":`)
+		buf.Write(b)
 	}
 	buf.WriteByte('}')
 	return buf.Bytes(), nil

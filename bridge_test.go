@@ -1102,8 +1102,15 @@ func TestOwnerCommandInsideBusinessChat(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 	sends := h.tg.sends()
-	if len(sends) == 0 || sends[0]["business_connection_id"] != testConn {
-		t.Fatal("reply must go through the business connection")
+	if len(sends) != 1 {
+		t.Fatalf("sends = %d, want 1", len(sends))
+	}
+	// The answer belongs to the owner: it must not appear in the customer chat.
+	if id, _ := sends[0]["chat_id"].(float64); int64(id) != testOwner {
+		t.Fatalf("reply went to chat %v, want the owner", sends[0]["chat_id"])
+	}
+	if _, biz := sends[0]["business_connection_id"]; biz {
+		t.Fatal("owner-only output must not use the business connection")
 	}
 }
 

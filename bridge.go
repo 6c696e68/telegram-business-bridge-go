@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,7 @@ type chatState struct {
 	updated    int64
 	runes      int
 	images     []string // image file IDs waiting for the next reply (newest kept)
+	voices     []string // voice file IDs waiting for transcription (newest kept)
 	userGen    int      // bumped on every remembered user message
 	repliedGen int      // highest userGen already covered by a sent reply
 	ownerGen   int      // highest userGen the owner answered personally
@@ -55,9 +57,13 @@ type chatState struct {
 	// followupAfter is the earliest unix time the sweep may retry this chat,
 	// so a failing LLM is not hammered every tick.
 	followupAfter int64
-	active        int // reply jobs holding this chat; active chats are never evicted
-	lk            sync.Mutex
-	el            *list.Element
+	active        int  // reply work holding this chat; active chats are never evicted
+	looping       bool // one reply worker per chat; extra messages steer it
+	// lastUserAtWall and sentAtWall are wall-clock stamps used by the debounce
+	// window, so it stays real time even under a test clock.
+	lastUserAtWall time.Time
+	sentAtWall     time.Time
+	el             *list.Element
 }
 
 type Bridge struct {
@@ -83,8 +89,15 @@ type Bridge struct {
 	lru         *list.List // front = most recently used
 	llmSem      chan struct{}
 	visionSem   chan struct{} // at most one image request in memory
-	llmActive   int
-	sysPrompt   string
+	asrSem      chan struct{} // at most one transcription request at a time
+	media       *http.Client  // audio download/transcribe and price lookups
+	quoteMu     sync.Mutex
+	quoteCache  map[string]quoteEntry
+	// visionLLM handles turns that carry images when vision_model is set, so a
+	// text-only model can stay primary.
+	visionLLM Completer
+	llmActive int
+	sysPrompt string
 
 	// storage (storage.go). Only the flush worker/Close writes the DB.
 	db           *bolt.DB
@@ -110,6 +123,7 @@ type Bridge struct {
 	ownerEditActive bool       // an owner-chat job is running (guarded by mu)
 	ownerEditQueue  []ownerMsg // owner messages waiting for that job (guarded by mu)
 	ownerChat       []ChatMsg  // short rolling context of the owner chat (guarded by mu)
+	ownerLastAt     time.Time  // wall clock of the latest owner message (guarded by mu)
 
 	// chat transcripts for /tomtat (transcript.go), guarded by mu
 	trPending   map[string]trPending // queued for the next flush (DB mode)
@@ -136,6 +150,9 @@ func NewBridge(cfg Config, tg Sender, llm Completer) *Bridge {
 		lru:        list.New(),
 		llmSem:     make(chan struct{}, cfg.MaxConcurrentLLM),
 		visionSem:  make(chan struct{}, 1),
+		asrSem:     make(chan struct{}, 1),
+		media:      newHTTPClient(2),
+		quoteCache: map[string]quoteEntry{},
 
 		pendingChats: map[string]chatRecord{},
 		trPending:    map[string]trPending{},
@@ -374,7 +391,7 @@ func (b *Bridge) onBusinessMessage(m *Message) string {
 		b.recordTranscriptLocked(key, "c", displayName(m.From), content)
 		b.mu.Unlock()
 	}
-	return b.maybeReply(key, m.Chat.ID, content, m.From, conn, m.Date, b.messageImages(m)...)
+	return b.maybeReply(key, m.Chat.ID, content, m.From, conn, m.Date, inboundMedia{b.messageImages(m), b.messageVoices(m)})
 }
 
 // onBusinessEdit treats an owner edit as presence; customer edits are ignored.
@@ -432,7 +449,7 @@ func (b *Bridge) onBotMessage(m *Message) string {
 		b.recordTranscriptLocked(key, "c", displayName(m.From), content)
 		b.mu.Unlock()
 	}
-	return b.maybeReply(key, m.Chat.ID, content, m.From, "", m.Date, b.messageImages(m)...)
+	return b.maybeReply(key, m.Chat.ID, content, m.From, "", m.Date, inboundMedia{b.messageImages(m), b.messageVoices(m)})
 }
 
 func (b *Bridge) addressed(m *Message, text string) bool {
@@ -444,6 +461,14 @@ func (b *Bridge) addressed(m *Message, text string) bool {
 }
 
 func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string {
+	// Command output is owner-only. A command typed in a customer chat must
+	// never answer into that chat: the customer would see the command list, the
+	// rule files and the owner's setup. Answer in the owner's private chat
+	// instead, and never fall back to the customer chat if that fails.
+	privateChat, privateConn := chatID, conn
+	if conn != "" {
+		privateChat, privateConn = b.cfg.OwnerID, ""
+	}
 	var msg string
 	switch cmd {
 	case "/pause":
@@ -490,7 +515,7 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 		b.mu.Unlock()
 		msg = fmt.Sprintf("🔄 Đã nạp lại system prompt (%d ký tự) và rules (%d ký tự).", runeCount(p), rlen)
 	case "/rules":
-		reply, async := b.rulesCommand(chatID, conn, args)
+		reply, async := b.rulesCommand(privateChat, privateConn, args)
 		if async {
 			return "owner_edit"
 		}
@@ -577,11 +602,17 @@ func (b *Bridge) ownerCommand(chatID int64, conn, key, cmd, args string) string 
 			"Quy tắc: /rules (xem) · /rules add|del|set|edit|undo|reset|off|on\n" +
 			"Hoặc nhắn tự nhiên cho bot để sửa quy tắc."
 	}
-	b.sendMsg(chatID, msg, conn)
+	b.sendMsg(privateChat, msg, privateConn)
 	return "owner_cmd"
 }
 
-func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64, images ...string) string {
+// inboundMedia is what a customer message carries besides text.
+type inboundMedia struct {
+	images []string
+	voices []string
+}
+
+func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, conn string, date int64, media inboundMedia) string {
 	// A stale message (Telegram may keep un-acked updates up to 24h) must not
 	// resurrect the bot after a restart; the offset still advances in Run.
 	if b.isStale(date) {
@@ -605,12 +636,12 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 	// a later follow-up) but stay silent now.
 	if conn != "" {
 		if b.isMutedLocked(key) {
-			b.noteUserLocked(key, text, chatID, conn, uid, images)
+			b.noteUserLocked(key, text, chatID, conn, uid, media)
 			b.mu.Unlock()
 			return "muted"
 		}
 		if !b.ownerAwayLocked() {
-			b.noteUserLocked(key, text, chatID, conn, uid, images)
+			b.noteUserLocked(key, text, chatID, conn, uid, media)
 			b.mu.Unlock()
 			return "owner_online"
 		}
@@ -622,25 +653,23 @@ func (b *Bridge) maybeReply(key string, chatID int64, text string, from *User, c
 		b.mu.Unlock()
 		return "rate_limited"
 	}
-	cs := b.noteUserLocked(key, text, chatID, conn, uid, images)
-	cs.active++
+	cs := b.noteUserLocked(key, text, chatID, conn, uid, media)
+	// One worker per chat: from here on the message only joins the history and
+	// the running loop steers to a single merged reply.
+	b.startReplyLocked(cs, key, chatID, conn, false)
 	b.mu.Unlock()
-
-	b.jobWG.Add(1)
-	go func() {
-		defer b.jobWG.Done()
-		b.replyJob(cs, key, chatID, conn)
-	}()
 	return "queued"
 }
 
 // noteUserLocked remembers a customer message and marks it unanswered.
 // Caller holds b.mu.
-func (b *Bridge) noteUserLocked(key, text string, chatID int64, conn string, uid int64, images []string) *chatState {
+func (b *Bridge) noteUserLocked(key, text string, chatID int64, conn string, uid int64, media inboundMedia) *chatState {
 	cs := b.touchLocked(key)
 	cs.chatID, cs.conn, cs.lastUID = chatID, conn, uid
-	addImagesLocked(cs, images)
+	addImagesLocked(cs, media.images)
+	addVoicesLocked(cs, media.voices)
 	cs.lastUserAt = b.now().Unix()
+	cs.lastUserAtWall = time.Now()
 	cs.userGen++
 	return b.rememberLocked(key, "user", text)
 }
@@ -754,86 +783,179 @@ func (b *Bridge) chatKeys() []string {
 
 // ---------- reply pipeline ----------
 
-func (b *Bridge) replyJob(cs *chatState, key string, chatID int64, conn string) {
-	b.replyJobOpt(cs, key, chatID, conn, false)
+// maxSteerRounds bounds how many times one turn may be rebuilt because the
+// customer kept typing: the first answer plus one retry with the newer context.
+const maxSteerRounds = 2
+
+// startReplyLocked launches the chat worker when none is running. Caller holds
+// b.mu.
+func (b *Bridge) startReplyLocked(cs *chatState, key string, chatID int64, conn string, followup bool) bool {
+	if cs.looping {
+		return false
+	}
+	cs.looping = true
+	cs.active++
+	b.jobWG.Add(1)
+	go func() {
+		defer b.jobWG.Done()
+		b.replyLoop(cs, key, chatID, conn, followup)
+	}()
+	return true
 }
 
-// replyJobOpt runs one reply. followup marks a sweep-started reply whose rate
-// slot is consumed only once the message is actually delivered.
-func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn string, followup bool) {
+// replyLoop runs one turn per chat. A single worker per chat plus steering is
+// what keeps one turn to one reply instead of two bubbles that talk over each
+// other. followup marks a sweep-started reply whose rate slot is consumed only
+// once the message is actually delivered.
+func (b *Bridge) replyLoop(cs *chatState, key string, chatID int64, conn string, followup bool) {
+	sent := false
 	defer func() {
 		if r := recover(); r != nil {
-			logf("ERROR", "reply job crashed: %v", r)
+			logf("ERROR", "reply loop crashed: %v", r)
 		}
-		b.mu.Lock()
-		cs.active--
-		b.mu.Unlock()
+		// Always hand the chat back, even after a panic: a worker that keeps
+		// cs.looping set would silently stop answering that chat.
+		b.finishReply(cs, key, chatID, conn, sent)
 	}()
 
-	cs.lk.Lock() // one reply at a time per chat keeps the conversation ordered
-	defer cs.lk.Unlock()
+	var carry []string
+	for round := 0; round < maxSteerRounds; round++ {
+		b.waitQuiet(cs)
 
-	// Wait a moment so a burst of consecutive messages is answered together
-	// (one reply, lower token cost) instead of once per message.
-	if d := time.Duration(b.cfg.DebounceMS) * time.Millisecond; d > 0 {
-		b.sleep(context.Background(), d)
-	}
-
-	b.mu.Lock()
-	if b.silencedLocked(key, conn) {
+		b.mu.Lock()
+		if b.silencedLocked(key, conn) || !cs.pendingLocked() {
+			b.mu.Unlock()
+			break
+		}
+		voiceIDs := cs.voices
+		cs.voices = nil
 		b.mu.Unlock()
+
+		// Voice notes are transcribed before the turn is built: the model must
+		// read what the customer said, not a placeholder.
+		if len(voiceIDs) > 0 {
+			vctx, vcancel := context.WithTimeout(context.Background(), 20*time.Second)
+			text := b.transcribeVoices(vctx, voiceIDs)
+			vcancel()
+			if text != "" {
+				b.mu.Lock()
+				b.applyVoiceTranscriptLocked(cs, text)
+				b.mu.Unlock()
+			}
+		}
+
+		b.mu.Lock()
+		if b.silencedLocked(key, conn) || !cs.pendingLocked() {
+			b.mu.Unlock()
+			break
+		}
+		gen := cs.userGen
+		msgs := b.turnMessagesLocked(cs)
+		imageIDs := append(append([]string(nil), carry...), cs.images...)
+		cs.images = nil
+		b.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go b.typingLoop(ctx, chatID, conn)
+		t0 := time.Now()
+		reply, err := b.answerTurn(ctx, msgs, imageIDs)
+		cancel()
+		if err != nil {
+			logf("WARN", "llm error: %v", err)
+			break
+		}
+		if reply == "" {
+			break
+		}
+
+		b.mu.Lock()
+		// The owner may have come online or answered while the model was thinking.
+		if b.silencedLocked(key, conn) || cs.ownerGen >= gen {
+			b.mu.Unlock()
+			break
+		}
+		// Steering: a newer message landed while the model was thinking, so this
+		// answer is already out of date. Dropping it and rebuilding the turn
+		// once is what turns two competing bubbles into one merged reply.
+		if cs.userGen > gen && round < maxSteerRounds-1 {
+			b.mu.Unlock()
+			carry = imageIDs
+			logf("INFO", "steering: dropped a stale reply for a newer message")
+			continue
+		}
+		b.mu.Unlock()
+
+		reply = truncReply(reply, b.cfg.MaxReplyChars)
+		if !b.sendMsg(chatID, reply, conn) {
+			break
+		}
+		b.commitReply(cs, key, gen, reply, conn, followup, t0)
+		sent = true
 		return
 	}
-	// Everything was already answered by another job or by the owner.
-	if !cs.pendingLocked() {
-		b.mu.Unlock()
+}
+
+// waitQuiet waits until the customer has been silent for debounce_ms, so a burst
+// of consecutive messages (photo, caption, "sell đây") is answered once. Unlike
+// a fixed sleep it restarts on every new message; debounce_max_ms bounds the
+// wait so a chatty customer is never left hanging.
+func (b *Bridge) waitQuiet(cs *chatState) {
+	d := time.Duration(b.cfg.DebounceMS) * time.Millisecond
+	if d <= 0 {
 		return
 	}
-	gen := cs.userGen
+	max := time.Duration(b.cfg.DebounceMaxMS) * time.Millisecond
+	if max < d {
+		max = d
+	}
+	start := time.Now()
+	for {
+		b.mu.Lock()
+		last := cs.lastUserAtWall
+		b.mu.Unlock()
+		idle := time.Since(last)
+		if idle >= d {
+			return
+		}
+		elapsed := time.Since(start)
+		if elapsed >= max {
+			return
+		}
+		w := d - idle
+		if rem := max - elapsed; w > rem {
+			w = rem
+		}
+		if w < 10*time.Millisecond {
+			w = 10 * time.Millisecond
+		}
+		b.sleep(context.Background(), w)
+	}
+}
+
+// turnMessagesLocked snapshots the system prompt and history for one turn.
+// Caller holds b.mu.
+func (b *Bridge) turnMessagesLocked(cs *chatState) []ChatMsg {
 	note := introFirst
 	if cs.introduced {
 		note = introDone
 	}
 	system := b.sysPrompt + b.subst(note) + b.rulesNoteLocked()
+	if b.quoteOn() {
+		system += quoteNote
+	}
 	msgs := make([]ChatMsg, 0, len(cs.msgs)+1)
 	msgs = append(msgs, ChatMsg{Role: "system", Content: system})
-	msgs = append(msgs, cs.msgs...)
-	imageIDs := cs.images
-	cs.images = nil
-	b.mu.Unlock()
+	return append(msgs, cs.msgs...)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go b.typingLoop(ctx, chatID, conn)
-
-	t0 := time.Now()
-	reply, err := b.callWithImages(ctx, msgs, imageIDs)
-	cancel()
-	if err != nil {
-		logf("WARN", "llm error: %v", err)
-		return
-	}
-	if reply == "" {
-		return
-	}
-
-	// The owner may have come online or answered while the model was thinking.
-	b.mu.Lock()
-	if b.silencedLocked(key, conn) || cs.ownerGen >= gen {
-		b.mu.Unlock()
-		return
-	}
-	b.mu.Unlock()
-
-	reply = truncReply(reply, b.cfg.MaxReplyChars)
-	if !b.sendMsg(chatID, reply, conn) {
-		return
-	}
+// commitReply records a delivered reply. Caller does not hold b.mu.
+func (b *Bridge) commitReply(cs *chatState, key string, gen int, reply, conn string, followup bool, t0 time.Time) {
 	fire := false
 	b.mu.Lock()
 	cs.introduced = true
 	cs.repliedGen = gen
-	if chatID > 0 { // private chats only; group/channel IDs are negative
+	cs.sentAtWall = time.Now()
+	if cs.chatID > 0 { // private chats only; group/channel IDs are negative
 		b.recordTranscriptLocked(key, "b", "", reply)
 	}
 	cs.followupAfter = 0
@@ -872,8 +994,29 @@ func (b *Bridge) replyJobOpt(cs *chatState, key string, chatID int64, conn strin
 	logf("INFO", "replied %s in %.1fs", kind, time.Since(t0).Seconds())
 }
 
+// finishReply releases the chat worker. A message that arrived after the reply
+// was delivered opens a new turn; one the reply already covered (it was merged
+// into the answered context) must not produce a second bubble.
+func (b *Bridge) finishReply(cs *chatState, key string, chatID int64, conn string, sent bool) {
+	b.mu.Lock()
+	cs.looping = false
+	cs.active--
+	if sent && !b.silencedLocked(key, conn) && cs.pendingLocked() &&
+		cs.lastUserAtWall.After(cs.sentAtWall) {
+		b.startReplyLocked(cs, key, chatID, conn, false)
+	}
+	b.mu.Unlock()
+}
+
 // callLLM bounds concurrency and retries 429, 5xx and transport failures.
 func (b *Bridge) callLLM(ctx context.Context, msgs []ChatMsg) (string, error) {
+	return b.callLLMWith(ctx, b.llm, msgs)
+}
+
+// callLLMWith bounds concurrency and retries 429, 5xx and transport failures
+// for one client. The vision model shares the semaphore: same upstream, same
+// memory budget.
+func (b *Bridge) callLLMWith(ctx context.Context, client Completer, msgs []ChatMsg) (string, error) {
 	select {
 	case b.llmSem <- struct{}{}:
 	case <-ctx.Done():
@@ -892,7 +1035,7 @@ func (b *Bridge) callLLM(ctx context.Context, msgs []ChatMsg) (string, error) {
 
 	for attempt := 0; ; attempt++ {
 		actx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.LLMTimeoutSec)*time.Second)
-		reply, err := b.llm.Chat(actx, msgs)
+		reply, err := client.Chat(actx, msgs)
 		cancel()
 		if err == nil {
 			return reply, nil
@@ -941,10 +1084,16 @@ func (b *Bridge) typingLoop(ctx context.Context, chatID int64, conn string) {
 
 // sendMsg retries on flood-control (retry_after) and transport errors.
 func (b *Bridge) sendMsg(chatID int64, text, conn string) bool {
+	html, formatted := telegramHTML(text)
 	params := map[string]any{"chat_id": chatID, "text": text}
 	if conn != "" {
 		params["business_connection_id"] = conn
 	}
+	if formatted {
+		params["text"] = html
+		params["parse_mode"] = "HTML"
+	}
+	sendFormatted := formatted
 	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		err := b.tg.Call(ctx, "sendMessage", params, nil)
@@ -960,6 +1109,15 @@ func (b *Bridge) sendMsg(chatID int64, text, conn string) bool {
 					wait = 30
 				}
 				b.sleep(context.Background(), time.Duration(wait)*time.Second)
+				continue
+			}
+			// Telegram may still refuse the HTML: fall back to the plain text
+			// once rather than dropping the reply.
+			if sendFormatted {
+				logf("WARN", "sendMessage HTML rejected (%d), retrying as plain text", te.Code)
+				delete(params, "parse_mode")
+				params["text"] = text
+				sendFormatted = false
 				continue
 			}
 			logf("WARN", "sendMessage failed: %d", te.Code)

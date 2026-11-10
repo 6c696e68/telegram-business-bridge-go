@@ -25,6 +25,7 @@ func opsHarness(t *testing.T) (*harness, string, string) {
 		c.RulesFile = ai
 		c.RulesPinnedFile = pin
 		c.RulesUpdateEvery = 2
+		c.OwnerDebounceMS = 0 // these tests drive the queue, not the quiet window
 	})
 	return h, ai, pin
 }

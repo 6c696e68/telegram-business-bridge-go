@@ -61,6 +61,104 @@ func TestDebounceDisabledKeepsPerMessageReplies(t *testing.T) {
 	waitSent(t, h, 2)
 }
 
+// A second message that lands while the model is still thinking must steer the
+// turn instead of starting a second one: the customer gets one reply, built
+// from both messages.
+func TestSecondMessageDuringLLMProducesOneReply(t *testing.T) {
+	h := newHarness(func(c *Config) { c.DebounceMS = 0 })
+	release := make(chan struct{})
+	h.llm.block = release
+
+	h.b.handleUpdate(dm(660, 660, "ảnh chart đây"))
+	waitFor(t, "first llm call", func() bool { return h.llm.calls() == 1 })
+	if got := h.b.handleUpdate(dm(660, 660, "sell đây")); got != "queued" {
+		t.Fatalf("a message during a turn must join it, got %q", got)
+	}
+	close(release)
+
+	waitSent(t, h, 1)
+	settle()
+	if n := len(h.tg.sends()); n != 1 {
+		t.Fatalf("one turn must produce exactly one reply, got %d", n)
+	}
+	if c := h.llm.calls(); c != 2 {
+		t.Fatalf("a steered turn re-runs once, llm calls = %d", c)
+	}
+	joined := ""
+	for _, m := range h.llm.lastSeen() {
+		joined += m.Content + "\n"
+	}
+	if !strings.Contains(joined, "sell đây") {
+		t.Fatal("the retried turn must see the newer message")
+	}
+	h.b.mu.Lock()
+	looping := h.b.chats["d:660"].looping
+	h.b.mu.Unlock()
+	if looping {
+		t.Fatal("the worker must release the chat after a turn")
+	}
+}
+
+// The reported bug: a chart photo followed by "sell đây" used to produce two
+// business replies that talked over each other.
+func TestPhotoThenTextYieldsOneBusinessReply(t *testing.T) {
+	h := newHarness(func(c *Config) { c.DebounceMS = 0 })
+	release := make(chan struct{})
+	h.llm.block = release
+
+	h.b.handleUpdate(biz(testConn, 661, 661, "chart"))
+	waitFor(t, "first llm call", func() bool { return h.llm.calls() == 1 })
+	h.b.handleUpdate(biz(testConn, 661, 661, "sell đây"))
+	close(release)
+
+	waitSent(t, h, 1)
+	settle()
+	if n := len(h.tg.sends()); n != 1 {
+		t.Fatalf("photo + a follow-up line must be one reply, got %d", n)
+	}
+}
+
+// debounce_ms alone would keep a chatty customer waiting forever; debounce_max_ms
+// caps the total wait even while messages keep arriving.
+func TestDebounceMaxBoundsWait(t *testing.T) {
+	h := newHarness(func(c *Config) { c.DebounceMS = 200; c.DebounceMaxMS = 400 })
+	h.b.sleep = func(ctx context.Context, d time.Duration) {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+	}
+	h.b.handleUpdate(dm(662, 662, "một"))
+
+	// The customer keeps typing, so the quiet window never closes on its own.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tk := time.NewTicker(60 * time.Millisecond)
+		defer tk.Stop()
+		for i := 0; i < 40; i++ {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				h.b.handleUpdate(dm(662, 662, "còn đây"))
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(h.tg.sends()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if len(h.tg.sends()) == 0 {
+		t.Fatal("debounce_max_ms must bound the wait")
+	}
+}
+
 func TestStatsCommand(t *testing.T) {
 	h := newHarness(nil)
 	h.b.handleUpdate(dm(testOwner, testOwner, "/stats"))

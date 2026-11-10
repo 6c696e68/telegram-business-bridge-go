@@ -34,6 +34,7 @@ type Message struct {
 	Text                 string      `json:"text"`
 	Caption              string      `json:"caption"`
 	Photo                []PhotoSize `json:"photo"`
+	Voice                *Voice      `json:"voice"`
 	Document             *Document   `json:"document"`
 	Sticker              *Sticker    `json:"sticker"`
 	Quote                *TextQuote  `json:"quote"`
@@ -44,6 +45,14 @@ type PhotoSize struct {
 	FileID   string `json:"file_id"`
 	Width    int    `json:"width"`
 	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size"`
+}
+
+// Voice is a voice note. Only the fields the bridge uses are kept.
+type Voice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	MimeType string `json:"mime_type"`
 	FileSize int64  `json:"file_size"`
 }
 

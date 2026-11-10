@@ -33,6 +33,7 @@ func markerNeutral(s string) string {
 	for _, pair := range [][2]string{
 		{"[Đang trả lời", "(Đang trả lời"},
 		{"[Ảnh]", "(Ảnh)"},
+		{"[Voice]", "(Voice)"}, // a customer must not forge a transcript marker
 		{"[Gửi một ảnh]", "(Gửi một ảnh)"},
 		{"[Sticker ", "(Sticker "},
 		{"[nội dung không phải văn bản]", "(nội dung không phải văn bản)"},
@@ -84,6 +85,11 @@ func messageContent(m *Message) string {
 //	[Ảnh] còn màu đen không?
 func (b *Bridge) promptText(m *Message) string {
 	content := messageContent(m)
+	// With transcription on, a voice note becomes a marker the worker replaces
+	// with the transcript before the turn is built.
+	if content == "" && b.transcribeOn() && m.voiceFileID() != "" {
+		content = voiceMarker
+	}
 	rt := m.ReplyToMessage
 	if rt == nil {
 		return content
@@ -248,8 +254,17 @@ const imageDroppedNote = "\n[Có ảnh đính kèm nhưng model AI hiện tại 
 
 // callLLMVision calls the model and, if it rejects the images, retries once
 // without them so the conversation still gets an answer.
+// visionClient is the client used for turns that carry images: the dedicated
+// vision model when configured, else the main one.
+func (b *Bridge) visionClient() Completer {
+	if b.visionLLM != nil {
+		return b.visionLLM
+	}
+	return b.llm
+}
+
 func (b *Bridge) callLLMVision(ctx context.Context, msgs []ChatMsg) (string, error) {
-	out, err := b.callLLM(ctx, msgs)
+	out, err := b.callLLMWith(ctx, b.visionClient(), msgs)
 	if err == nil || !hasImages(msgs) || !visionRejected(err) || ctx.Err() != nil {
 		return out, err
 	}
@@ -262,5 +277,5 @@ func (b *Bridge) callLLMVision(ctx context.Context, msgs []ChatMsg) (string, err
 		}
 		plain[i] = m
 	}
-	return b.callLLM(ctx, plain)
+	return b.callLLMWith(ctx, b.visionClient(), plain)
 }

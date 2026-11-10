@@ -38,6 +38,16 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
   `/rules add …`, `/rules del P1 A2`, `/rules set …` (multi-line), `/rules edit <request>`,
   `/rules undo` (one level). Sensitive data is still rejected from learned rules; your own rules
   are saved as written.
+- Voice notes: with `transcribe_model` set, a customer's voice message is downloaded (≤ `max_voice_sec`,
+  ≤4 MB), transcribed through an OpenAI-compatible `/audio/transcriptions` endpoint, and only the text
+  is kept — the audio is never stored. The transcript is written into the chat history, so later turns and
+  `/tomtat` read what was actually said. Without `transcribe_model` nothing changes: the message keeps the
+  non-text placeholder. One transcription runs at a time and failures still produce a reply.
+- Price tool: with `quote_url` set, the model gets one tool, `get_quote(symbol)`, and a prompt rule that
+  forbids quoting a price it did not just fetch (and that a chart screenshot is not a price source).
+  The lookup is a plain GET to your endpoint (result cached `quote_cache_sec`), capped by `quote_timeout_ms`;
+  at most one tool round runs per turn, and a failed lookup falls back to the model's first answer.
+  Requests carrying images never use the tool, so a chart turn cannot end up quoting numbers.
 - Images: photos and images sent as files (customers and the owner's private chat) are downloaded and
   sent to the model with the message (largest size ≤1280 px / 2 MB, up to 3 per reply, 3 MB of images per
   request). Only one image request is held in memory at a time (≈11 MB peak), text chats never wait for
@@ -57,8 +67,11 @@ It is built for low-memory routers (aarch64; measured heap +5 MB worst case, see
 - Owner commands (owner only, private chat or a business chat): `/here`, `/away`, `/tomtat`, `/pause`, `/resume`,
   `/status`, `/stats`, `/reload`, `/rules [add|del|set|edit|undo|reset|off|on]`, `/forget`. In the
   private chat with the bot, the owner talks to an assistant that can also edit the rules.
-- Bursts are coalesced: consecutive messages within `debounce_ms` produce one reply that answers the
-  whole burst, saving tokens and avoiding duplicate answers.
+- One turn, one reply: consecutive messages are answered as a single turn. The worker waits for
+  `debounce_ms` of silence after the *last* message (`debounce_max_ms` caps that wait, so a chatty
+  customer is never left hanging), and a message that lands while the model is still thinking
+  **steers** the turn: the stale answer is dropped and rebuilt once with the newer context, so the
+  customer never gets two bubbles that talk over each other.
 - Limits: replies per user per hour, daily cap, bounded concurrent LLM calls, LRU chat memory with a
   per-chat character cap.
 - Retries on LLM 429/5xx/transport errors and on Telegram flood control (`retry_after`).
@@ -138,6 +151,13 @@ it can be deleted. Only one process may open the database at a time.
 | `shutdown_drain_sec` | 15 | seconds to wait for in-flight replies on SIGTERM (0 = off) |
 | `stats_log_min` | 60 | minutes between non-sensitive stats log lines (0 = off) |
 | `debounce_ms` | 700 | wait this long for a burst before replying (0 = reply per message) |
+| `debounce_max_ms` | 2500 | cap on the whole debounce wait while messages keep arriving |
+| `transcribe_model` | — | transcription model (e.g. `whisper-1`); empty = voice notes are not transcribed |
+| `transcribe_api_base` / `transcribe_api_key` | `api_base` / `api_key` | separate endpoint for audio if needed |
+| `max_voice_sec` | 120 | voice notes longer than this are not transcribed (max 300) |
+| `quote_url` | — | price endpoint, `{symbol}` is substituted; empty = the tool is off |
+| `quote_timeout_ms` | 3000 | lookup timeout |
+| `quote_cache_sec` | 10 | per-symbol cache (0 disables) |
 | `owner_away_minutes` | 30 | owner inactivity required before the bot answers business chats (0 = always answer) |
 | `followup_max_min` | 0 (off) | opt-in: answer messages sent while you were online, up to this age in minutes |
 | `max_tokens` | 1200 | completion token cap per reply |

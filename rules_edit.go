@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Owner editing of the rule files from Telegram.
@@ -499,6 +500,7 @@ type ownerMsg struct {
 
 func (b *Bridge) startOwnerEdit(chatID int64, conn, request string, images ...string) {
 	b.mu.Lock()
+	b.ownerLastAt = time.Now()
 	if b.ownerEditActive {
 		b.ownerEditQueue = append(b.ownerEditQueue, ownerMsg{request, images})
 		b.mu.Unlock()
@@ -512,26 +514,77 @@ func (b *Bridge) startOwnerEdit(chatID int64, conn, request string, images ...st
 		defer b.jobWG.Done()
 		next := ownerMsg{request, images}
 		for {
-			b.runOwnerEdit(chatID, conn, next)
-			b.mu.Lock()
-			if len(b.ownerEditQueue) == 0 {
+			// One burst, one answer: wait for the owner to stop typing and fold
+			// everything that arrived meanwhile into this single turn.
+			next = b.coalesceOwner(next)
+			if strings.TrimSpace(next.text) == "" && len(next.images) == 0 {
+				b.mu.Lock()
 				b.ownerEditActive = false
 				b.mu.Unlock()
 				return
 			}
-			var texts, imgs []string
-			for _, q := range b.ownerEditQueue {
-				texts = append(texts, q.text)
-				imgs = append(imgs, q.images...)
+			b.runOwnerEdit(chatID, conn, next)
+			b.mu.Lock()
+			pending := len(b.ownerEditQueue) > 0
+			if !pending {
+				b.ownerEditActive = false
+				b.mu.Unlock()
+				return
 			}
-			b.ownerEditQueue = nil
 			b.mu.Unlock()
-			if len(imgs) > maxImagesPerRequest {
-				imgs = imgs[len(imgs)-maxImagesPerRequest:]
-			}
-			next = ownerMsg{strings.Join(texts, "\n"), imgs}
+			next = ownerMsg{}
 		}
 	}()
+}
+
+// coalesceOwner waits debounce_ms for silence and folds every queued owner
+// message into one turn, so a burst gets one reply instead of one per message.
+// debounce_max_ms bounds the wait for someone who keeps typing.
+func (b *Bridge) coalesceOwner(next ownerMsg) ownerMsg {
+	d := time.Duration(b.cfg.OwnerDebounceMS) * time.Millisecond
+	if d > 0 {
+		max := time.Duration(b.cfg.DebounceMaxMS) * time.Millisecond
+		if max < d {
+			max = d
+		}
+		start := time.Now()
+		for {
+			b.mu.Lock()
+			last := b.ownerLastAt
+			b.mu.Unlock()
+			idle := time.Since(last)
+			if idle >= d || time.Since(start) >= max {
+				break
+			}
+			w := d - idle
+			if rem := max - time.Since(start); w > rem {
+				w = rem
+			}
+			if w < 10*time.Millisecond {
+				w = 10 * time.Millisecond
+			}
+			b.sleep(context.Background(), w)
+		}
+	}
+
+	var texts, imgs []string
+	if strings.TrimSpace(next.text) != "" || len(next.images) > 0 {
+		texts = append(texts, next.text)
+		imgs = append(imgs, next.images...)
+	}
+	b.mu.Lock()
+	for _, q := range b.ownerEditQueue {
+		if strings.TrimSpace(q.text) != "" {
+			texts = append(texts, q.text)
+		}
+		imgs = append(imgs, q.images...)
+	}
+	b.ownerEditQueue = nil
+	b.mu.Unlock()
+	if len(imgs) > maxImagesPerRequest {
+		imgs = imgs[len(imgs)-maxImagesPerRequest:]
+	}
+	return ownerMsg{text: strings.Join(texts, "\n"), images: imgs}
 }
 
 func (b *Bridge) runOwnerEdit(chatID int64, conn string, msg ownerMsg) {

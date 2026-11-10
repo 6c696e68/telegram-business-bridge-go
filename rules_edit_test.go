@@ -332,19 +332,27 @@ func TestOwnerMessagesAreQueuedNotLost(t *testing.T) {
 		if !strings.HasPrefix(msgs[0].Content, editPromptPrefix) {
 			return "ok", false
 		}
+		req := msgs[1].Content
+		hasA, hasB := strings.Contains(req, "thêm A"), strings.Contains(req, "thêm B")
 		mu.Lock()
 		calls++
 		n := calls
 		mu.Unlock()
 		if n == 1 {
+			// hold the first turn so "thêm B" lands while the model is thinking
 			<-gate
+		}
+		// A burst may be answered as one merged turn. Either way both edits must
+		// be applied on top of the rules that were current when the turn started.
+		switch {
+		case hasA && hasB:
+			return `{"reply":"thêm A và B","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B.","ai_rules":null}`, true
+		case hasA:
 			return `{"reply":"thêm A","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.","ai_rules":null}`, true
+		case hasB && strings.Contains(req, "- A."):
+			return `{"reply":"thêm B","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B.","ai_rules":null}`, true
 		}
-		// the queued request must be computed from the file that already has A
-		if !strings.Contains(msgs[1].Content, "- A.") || !strings.Contains(msgs[1].Content, "thêm B") {
-			return `{"reply":"sai ngữ cảnh","owner_rules":null,"ai_rules":null}`, true
-		}
-		return `{"reply":"thêm B","owner_rules":"- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B.","ai_rules":null}`, true
+		return `{"reply":"sai ngữ cảnh","owner_rules":null,"ai_rules":null}`, true
 	}
 	h.b.handleUpdate(dm(testOwner, testOwner, "thêm A"))
 	waitFor(t, "first edit running", func() bool { return h.b.ownerEditBusy() })
@@ -355,10 +363,15 @@ func TestOwnerMessagesAreQueuedNotLost(t *testing.T) {
 		t.Fatalf("explicit edits must wait while the owner chat is busy: %q", lastSentText(h))
 	}
 	close(gate)
-	waitSent(t, h, 3)
 	waitFor(t, "queue drained", func() bool { return !h.b.ownerEditBusy() })
 	if got := readFile(t, pin); got != "- Luôn xưng em, không hứa hẹn thay chủ.\n- A.\n- B." {
 		t.Fatalf("both queued edits must land: %q", got)
+	}
+	if n := len(h.tg.sends()); n < 2 || n > 3 {
+		t.Fatalf("owner gets one or two bubbles for the burst, got %d", n)
+	}
+	if strings.Contains(lastSentText(h), "sai ngữ cảnh") {
+		t.Fatalf("a queued edit lost its context: %q", lastSentText(h))
 	}
 }
 
